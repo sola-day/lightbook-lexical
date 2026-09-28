@@ -1,4 +1,4 @@
-import type { LoroDoc, LoroEventBatch, LoroList, LoroMap } from "loro-crdt";
+import type { LoroDoc, LoroEventBatch, LoroMovableList, LoroMap } from "loro-crdt";
 import {
   $getRoot,
   $isElementNode,
@@ -22,7 +22,7 @@ const BLOCKS_KEY = "blocks";
  * package; no `loro-lexical` equivalent exists).
  *
  * Document shape in the `LoroDoc`, under `doc.getMap("lb")`:
- *   - `rootOrder`: a mergeable `LoroList<string>` of root-level block ids,
+ *   - `rootOrder`: a mergeable `LoroMovableList<string>` of root-level block ids,
  *     in order.
  *   - `blocks`: a mergeable `LoroMap<string, LoroMap>` from block id to
  *     that block's own container map, with:
@@ -40,7 +40,7 @@ const BLOCKS_KEY = "blocks";
  *         formatting on the same block concurrently can overwrite each
  *         other. Accepted trade for this tier.
  *       - `childOrder` (container types only): a mergeable
- *         `LoroList<string>` of this block's own children's ids, same
+ *         `LoroMovableList<string>` of this block's own children's ids, same
  *         shape as `rootOrder` one level down — recursion, not a flat
  *         per-type table.
  *
@@ -105,18 +105,46 @@ function writeAttrsAndText(block: LoroMap, spec: BlockSpec) {
   }
 }
 
-function reconcileOrder(list: LoroList, targetIds: string[]) {
-  const current = list.toArray() as string[];
+/**
+ * Reconciles `list` to `targetIds` using `LoroMovableList`'s real `move()`
+ * op for anything that's just changed position, instead of deleting and
+ * re-inserting everything. That distinction matters under concurrency: a
+ * delete+insert looks to Loro like "this block was destroyed and a new one
+ * was created at the same id" for that op, so a concurrent edit to that
+ * block's own text racing against someone else reordering it is more
+ * likely to collide; a real `move()` preserves the block's identity
+ * through the reorder, so the concurrent text edit and the move merge
+ * cleanly instead.
+ */
+function reconcileOrder(list: LoroMovableList, targetIds: string[]) {
+  let current = list.toArray() as string[];
   if (current.length === targetIds.length && current.every((v, i) => v === targetIds[i])) return;
-  // Simplest-correct strategy for this tier: full rewrite rather than a
-  // minimal-diff splice. Loro's CRDT semantics still make concurrent
-  // inserts/deletes at different positions converge; this just isn't the
-  // most surgical possible update.
-  list.delete(0, current.length);
-  for (const id of targetIds) list.push(id);
+
+  const targetSet = new Set(targetIds);
+  for (let i = current.length - 1; i >= 0; i--) {
+    if (!targetSet.has(current[i])) list.delete(i, 1);
+  }
+  current = list.toArray() as string[];
+
+  const currentSet = new Set(current);
+  for (let i = 0; i < targetIds.length; i++) {
+    if (!currentSet.has(targetIds[i])) {
+      list.insert(i, targetIds[i]);
+      currentSet.add(targetIds[i]);
+      current = list.toArray() as string[];
+    }
+  }
+
+  // Same set now, possibly different order — fix it with real moves.
+  for (let i = 0; i < targetIds.length; i++) {
+    if (current[i] === targetIds[i]) continue;
+    const from = current.indexOf(targetIds[i], i);
+    list.move(from, i);
+    current = list.toArray() as string[];
+  }
 }
 
-function writeChildren(blocksMap: LoroMap, orderList: LoroList, nodes: LexicalNode[], ids: BlockIdRegistry) {
+function writeChildren(blocksMap: LoroMap, orderList: LoroMovableList, nodes: LexicalNode[], ids: BlockIdRegistry) {
   const currentIds: string[] = [];
   for (const node of nodes) {
     const spec = lexicalNodeToBlockSpec(node);
@@ -126,7 +154,7 @@ function writeChildren(blocksMap: LoroMap, orderList: LoroList, nodes: LexicalNo
     const block = blocksMap.ensureMergeableMap(id);
     writeAttrsAndText(block, spec);
     if (spec.children !== undefined) {
-      const childOrder = block.ensureMergeableList("childOrder");
+      const childOrder = block.ensureMergeableMovableList("childOrder");
       writeChildren(blocksMap, childOrder, spec.children, ids);
     }
   }
@@ -135,7 +163,7 @@ function writeChildren(blocksMap: LoroMap, orderList: LoroList, nodes: LexicalNo
 
 function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry) {
   const lb = rootMap(doc);
-  const orderList = lb.ensureMergeableList(ROOT_ORDER_KEY);
+  const orderList = lb.ensureMergeableMovableList(ROOT_ORDER_KEY);
   const blocksMap = lb.ensureMergeableMap(BLOCKS_KEY);
   writeChildren(blocksMap, orderList, root.getChildren(), ids);
   doc.commit({ origin: "lb-local-edit" });
@@ -146,14 +174,14 @@ function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistr
 /** True when every `blocksMap`/`orderList` entry referenced actually resolves — used to detect "empty doc". */
 function isLoroDocEmpty(doc: LoroDoc): boolean {
   const lb = rootMap(doc);
-  const orderList = lb.get(ROOT_ORDER_KEY) as LoroList | undefined;
+  const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
   return !orderList || orderList.length === 0;
 }
 
 function readChildrenInto(
   parent: ElementNode,
   blocksMap: LoroMap,
-  orderList: LoroList,
+  orderList: LoroMovableList,
   ids: BlockIdRegistry,
   reuse: Map<string, LexicalNode>
 ) {
@@ -180,7 +208,7 @@ function readChildrenInto(
       applyTextRuns(node, text, runs as never);
     }
 
-    const childOrder = block.get("childOrder") as LoroList | undefined;
+    const childOrder = block.get("childOrder") as LoroMovableList | undefined;
     if (childOrder && $isElementNode(node)) {
       readChildrenInto(node, blocksMap, childOrder, ids, reuse);
     }
@@ -202,7 +230,7 @@ function readLoroToLexical(editor: LexicalEditor, doc: LoroDoc, ids: BlockIdRegi
   editor.update(
     () => {
       const lb = rootMap(doc);
-      const orderList = lb.get(ROOT_ORDER_KEY) as LoroList | undefined;
+      const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
       const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
       const root = $getRoot();
       if (!orderList || !blocksMap) return;

@@ -61,13 +61,22 @@ algebra across all of them):
   Myers' algorithm). This is deliberate: two people typing concurrently in
   the same paragraph is the scenario "feels like Google Docs" is actually
   judged on, so that's where the real merge effort goes.
-- Inline **formatting** (bold/italic/etc, as a run-length snapshot) and
-  **block structure/order** are synced as plain values / `LoroList`s that
-  get overwritten wholesale on change — not merged character-by-character.
-  Concurrent edits to the same paragraph's *formatting*, or structural
-  edits at the very same position, can overwrite each other; concurrent
-  edits at *different* positions (the common case) still merge correctly
-  because `LoroMap`/`LoroList` are themselves CRDTs.
+- Inline **formatting** (bold/italic/etc, as a run-length snapshot) is
+  synced as a plain value, overwritten wholesale on change — not merged
+  character-by-character. Concurrent formatting edits to the same
+  paragraph can overwrite each other.
+- Block **order** is a mergeable `LoroMovableList` of block ids, one per
+  nesting level (`rootOrder`, and each container block's own
+  `childOrder`), reconciled with real `LoroMovableList.move()` ops for
+  anything that only changed position rather than a delete+reinsert — see
+  `reconcileOrder` in `binding.ts`. This matters under concurrency: a
+  delete+insert looks to Loro like "destroyed and recreated" for that op,
+  so a concurrent edit to that block's own text racing a reorder is more
+  likely to collide; a real move preserves the block's identity through
+  the reorder, so the two merge cleanly instead — `test/collab.ts` has a
+  test that moves a paragraph and edits it (from the other peer) in the
+  same pass to confirm the edit lands on the right block, not a
+  duplicate.
 - Blockquotes flatten to one text block (no per-paragraph merge inside a
   quote); tables sync as an opaque whole-node JSON snapshot (no per-cell
   merge).

@@ -221,6 +221,83 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   bindingB.destroy();
 }
 
+// --- Reordering blocks uses LoroMovableList.move(), preserving identity ---
+// (not delete+reinsert) — a concurrent edit to the moved block's own text
+// should still land on it correctly after the peer replays the reorder.
+
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      for (const text of ["first", "second", "third"]) {
+        const p = $createParagraphNode();
+        p.append($createTextNode(text));
+        root.append(p);
+      }
+    },
+    { discrete: true }
+  );
+
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  ok(
+    textOf(editorB) === "first\n\nsecond\n\nthird",
+    `editor B starts with the same three paragraphs in order (got ${JSON.stringify(textOf(editorB))})`
+  );
+
+  // Reorder on A: move the "third" paragraph to the front.
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      const children = root.getChildren();
+      const third = children.find((c) => c.getTextContent() === "third")!;
+      third.remove();
+      root.splice(0, 0, [third]);
+    },
+    { discrete: true }
+  );
+
+  ok(
+    textOf(editorA) === "third\n\nfirst\n\nsecond",
+    `editor A's own reorder applied (got ${JSON.stringify(textOf(editorA))})`
+  );
+  ok(
+    textOf(editorB) === "third\n\nfirst\n\nsecond",
+    `editor B receives the reorder via the bridge (got ${JSON.stringify(textOf(editorB))})`
+  );
+
+  // Now edit the moved paragraph's text on B — it should land on the SAME
+  // logical block (now first), not create a duplicate or land on the
+  // wrong paragraph, proving the move preserved the block's identity.
+  editorB.update(
+    () => {
+      const root = $getRoot();
+      const moved = root.getChildren()[0] as any;
+      const textNode = moved.getFirstChild();
+      textNode.spliceText(textNode.getTextContentSize(), 0, "-edited", true);
+    },
+    { discrete: true }
+  );
+
+  ok(
+    textOf(editorA) === "third-edited\n\nfirst\n\nsecond",
+    `an edit to the moved block on B lands on the same block on A, not a duplicate (got ${JSON.stringify(textOf(editorA))})`
+  );
+
+  unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
