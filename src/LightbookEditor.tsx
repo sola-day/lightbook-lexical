@@ -36,10 +36,8 @@ export interface LightbookEditorProps {
 
 function ReadyPlugin({
   onReady,
-  onComment,
 }: {
   onReady?: (editor: LexicalEditor, suggestion: SuggestionController) => void;
-  onComment?: (threadId: string, previewText: string) => void;
 }) {
   const [editor] = useLexicalComposerContext();
   const controllerRef = useRef<SuggestionController | null>(null);
@@ -56,7 +54,6 @@ function ReadyPlugin({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor]);
 
-  void onComment;
   return null;
 }
 
@@ -112,7 +109,7 @@ export function LightbookEditor({
         <LinkPlugin />
         <SelectionToolbarPlugin onComment={onComment} />
         <BlockMenuPlugin />
-        <ReadyPlugin onReady={onReady} onComment={onComment} />
+        <ReadyPlugin onReady={onReady} />
         {onChange && <OnChangePlugin onChange={onChange} />}
         {collabPlugins}
       </div>

@@ -120,11 +120,26 @@ export function SelectionToolbarPlugin({ onComment }: SelectionToolbarPluginProp
     editor.dispatchCommand(TOGGLE_LINK_COMMAND, href);
   };
 
+  // `rect` (and this `top: fixed` positioning) is VIEWPORT-relative, not
+  // page-relative. Selecting text near the top of the viewport — common
+  // once the page is scrolled, not just at the very top of the document —
+  // used to push the toolbar to a negative `top`, rendering it (and its
+  // comment button) partially or fully above the visible viewport,
+  // effectively unreachable. Flip below the selection when there isn't
+  // enough room above, and clamp the horizontal center so a selection near
+  // either edge doesn't push the toolbar off-screen sideways either.
+  const TOOLBAR_HEIGHT = 46;
+  const HALF_TOOLBAR_WIDTH = 160;
+  const placeBelow = rect.top < TOOLBAR_HEIGHT + 8;
+  const top = placeBelow ? rect.bottom + 10 : rect.top - TOOLBAR_HEIGHT;
+  const centerX = rect.left + rect.width / 2;
+  const left = Math.min(Math.max(centerX, HALF_TOOLBAR_WIDTH + 8), window.innerWidth - HALF_TOOLBAR_WIDTH - 8);
+
   return (
     <div
       ref={toolbarRef}
       className="lb-toolbar-float"
-      style={{ position: "fixed", top: rect.top - 46, left: rect.left + rect.width / 2 }}
+      style={{ position: "fixed", top, left, transform: "translateX(-50%)" }}
       onMouseDown={(e) => e.preventDefault()}
     >
       <button type="button" className="lb-toolbar-btn" title="Heading 1" onClick={heading("h1")}>H1</button>

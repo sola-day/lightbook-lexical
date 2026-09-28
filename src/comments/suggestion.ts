@@ -79,6 +79,18 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
   const unregisterTransform = editor.registerNodeTransform(TextNode, (node) => {
     if (!active || isResolving) return;
     if (!$isTextNode(node)) return;
+    // IME composition (Chinese/Japanese/Korean input, etc.) fires many
+    // intermediate DOM/text changes while the browser's own composition
+    // UI still owns the caret — splitting the node and wrapping a partial,
+    // not-yet-committed fragment in a MarkNode mid-composition (as this
+    // transform otherwise would, on every intermediate change) confuses
+    // the browser about which DOM text node it's still composing into,
+    // which is what caused the cursor to land in the wrong place after
+    // every commit. Skip entirely while composing; the transform still
+    // runs once composition ends, by which point `node`'s text is the
+    // final committed string and the whole composed word is diffed and
+    // tagged as one atomic insertion, same as a paste.
+    if (editor.isComposing()) return;
 
     const parent = node.getParent();
     if (
