@@ -93,12 +93,15 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     }
 
     const key = node.getKey();
-    const prevText = prevTextCache.get(key);
+    // A key with no cache entry is a text node this controller has never
+    // diffed before. That's either a brand-new node (baseline "" — its
+    // whole content is an insertion, correctly) or a pre-existing node from
+    // before suggesting mode was turned on; `setSuggesting` pre-populates
+    // the cache for every node current at that moment specifically so the
+    // second case doesn't fall into this branch and get misread as the
+    // first — see its own comment.
+    const prevText = prevTextCache.get(key) ?? "";
     const newText = node.getTextContent();
-    if (prevText === undefined) {
-      prevTextCache.set(key, newText);
-      return;
-    }
     if (prevText === newText) return;
 
     let prefixLen = 0;
@@ -202,11 +205,11 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
         for (const node of toRemove) node.remove();
         for (const node of toUnwrap) $unwrapMarkNode(node);
       },
-      {
-        onUpdate: () => {
-          isResolving = false;
-        },
-      }
+      // `discrete: true` so a caller reading editor state right after
+      // accept/reject returns (as the example UI and the smoke tests both
+      // do) sees the resolved document, not a state still pending in a
+      // microtask.
+      { discrete: true, onUpdate: () => (isResolving = false) }
     );
   }
 
@@ -215,7 +218,21 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       return active != null;
     },
     setSuggesting(authorId) {
+      const turningOn = authorId != null && active == null;
       active = authorId ? { authorId } : null;
+      if (turningOn) {
+        // Prime the diff baseline with every text node's *current* content
+        // so the first real edit after turning suggesting on diffs against
+        // "what's actually in the document now", not against "" (which
+        // would misread all of it as one giant insertion the moment
+        // anything in that node changes) — see the node-transform's
+        // "unseen key" comment above for why this pairing matters.
+        editor.getEditorState().read(() => {
+          walkNode($getRoot(), (node) => {
+            if ($isTextNode(node)) prevTextCache.set(node.getKey(), node.getTextContent());
+          });
+        });
+      }
     },
     acceptSuggestion(suggestionId) {
       resolve(suggestionId, "accept");

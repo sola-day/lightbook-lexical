@@ -22,15 +22,25 @@ function walk(node: LexicalNode, visit: (node: LexicalNode) => void) {
   }
 }
 
-/** Wraps the current selection in a comment mark. Selection must be non-collapsed. */
+/**
+ * Wraps the current selection in a comment mark. Selection must be
+ * non-collapsed. `{discrete: true}` forces this update (and its
+ * reconciliation) to commit synchronously — without it, `editor.update()`
+ * schedules its reconciliation as a microtask, so a caller that (correctly)
+ * expects `listThreads(editor)` to already reflect a comment it just added
+ * would read stale state until the next microtask tick.
+ */
 export function addComment(editor: LexicalEditor, { threadId }: AddCommentOptions): boolean {
   let applied = false;
-  editor.update(() => {
-    const selection = $getSelection();
-    if (!$isRangeSelection(selection) || selection.isCollapsed()) return;
-    $wrapSelectionInMarkNode(selection, selection.isBackward(), commentMarkId(threadId));
-    applied = true;
-  });
+  editor.update(
+    () => {
+      const selection = $getSelection();
+      if (!$isRangeSelection(selection) || selection.isCollapsed()) return;
+      $wrapSelectionInMarkNode(selection, selection.isBackward(), commentMarkId(threadId));
+      applied = true;
+    },
+    { discrete: true }
+  );
   return applied;
 }
 
@@ -38,17 +48,20 @@ export function addComment(editor: LexicalEditor, { threadId }: AddCommentOption
 export function removeComment(editor: LexicalEditor, threadId: string): boolean {
   let removed = false;
   const id = commentMarkId(threadId);
-  editor.update(() => {
-    walk($getRoot(), (node) => {
-      if (!$isMarkNode(node)) return;
-      if (!node.hasID(id)) return;
-      removed = true;
-      const next = node.deleteID(id);
-      if ((next as MarkNode).getIDs().length === 0) {
-        $unwrapMarkNode(next as MarkNode);
-      }
-    });
-  });
+  editor.update(
+    () => {
+      walk($getRoot(), (node) => {
+        if (!$isMarkNode(node)) return;
+        if (!node.hasID(id)) return;
+        removed = true;
+        const next = node.deleteID(id);
+        if ((next as MarkNode).getIDs().length === 0) {
+          $unwrapMarkNode(next as MarkNode);
+        }
+      });
+    },
+    { discrete: true }
+  );
   return removed;
 }
 

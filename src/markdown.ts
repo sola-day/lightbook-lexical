@@ -1,6 +1,6 @@
 import {
-  $convertFromMarkdownString,
   $convertToMarkdownString,
+  $generateNodesFromMarkdownString,
   CHECK_LIST,
   CODE,
   ELEMENT_TRANSFORMERS,
@@ -12,6 +12,7 @@ import {
   ITALIC_STAR,
   type ElementTransformer,
   type TextFormatTransformer,
+  type TextMatchTransformer,
   type Transformer,
 } from "@lexical/markdown";
 import { $createParagraphNode, $createTextNode, type ElementNode, type LexicalNode } from "lexical";
@@ -53,9 +54,12 @@ const NOTICE: ElementTransformer = {
     return lines.map((line, i) => (i === 0 ? `> [!${kind}] ${line}` : `> ${line}`)).join("\n");
   },
   regExp: /^>\s\[!(info|warning|tip)\]\s?/,
-  replace: (parentNode, children) => {
-    const match = /^>\s\[!(info|warning|tip)\]\s?/.exec(parentNode.getTextContent());
-    const kind = (match?.[1] as NoticeKind) ?? "info";
+  replace: (parentNode, children, match) => {
+    // `parentNode`'s text no longer carries the matched "> [!kind] " prefix
+    // by the time `replace` runs (the block-matching machinery already
+    // consumed it) — the kind has to come from `match`, not by re-deriving
+    // it from `parentNode.getTextContent()` a second time.
+    const kind = (match[1] as NoticeKind) ?? "info";
     const notice = $createNoticeNode(kind);
     const paragraph = $createParagraphNode();
     paragraph.append(...children);
@@ -66,18 +70,30 @@ const NOTICE: ElementTransformer = {
   type: "element",
 };
 
-const IMAGE: ElementTransformer = {
+/**
+ * `ImageNode.isInline()` is true — it lives *inside* a paragraph like a
+ * link, not in place of one — so this has to be a `TextMatchTransformer`
+ * (matched while walking a paragraph's inline children), not an
+ * `ElementTransformer` (matched against a whole line/block). Using the
+ * wrong kind was a real bug caught by the smoke tests: import "worked" (the
+ * image node was created, just left oddly nested), but export silently
+ * produced nothing, since `$convertToMarkdownString` only ever hands a
+ * top-level node to `ElementTransformer.export`, never an inline child.
+ */
+const IMAGE: TextMatchTransformer = {
   dependencies: [ImageNode],
   export: (node) => {
     if (!$isImageNode(node)) return null;
     return `![${node.__alt ?? ""}](${node.getSrc()})`;
   },
-  regExp: /!\[([^[]*)\]\(([^()\s]+)\)\s?$/,
-  replace: (parentNode, _children, match) => {
+  importRegExp: /!\[([^[\]]*)\]\(([^()\s]+)\)/,
+  regExp: /!\[([^[\]]*)\]\(([^()\s]+)\)$/,
+  replace: (textNode, match) => {
     const [, alt, src] = match;
-    parentNode.replace($createImageNode({ src, alt }));
+    textNode.replace($createImageNode({ src, alt }));
   },
-  type: "element",
+  trigger: ")",
+  type: "text-match",
 };
 
 const VIDEO: ElementTransformer = {
@@ -111,7 +127,7 @@ function parseTableRow(line: string): string[] {
  * table transformer ships in `@lexical/markdown`. A table spans multiple
  * lines (header + divider + rows), which `ElementTransformer`'s one-line
  * `regExp` can't parse on its own, so tables are pulled out of the markdown
- * text *before* `$convertFromMarkdownString` sees it, built directly with
+ * text *before* `$generateNodesFromMarkdownString` sees it, built directly with
  * `@lexical/table`'s node constructors, and spliced back in as siblings —
  * see `markdownToNodes`/`nodesToMarkdown` below. Cells are treated as
  * single-paragraph plain text (same scope as the ProseMirror package).
@@ -182,14 +198,22 @@ function tableToMarkdown(table: TableNode): string {
   ].join("\n");
 }
 
-/** Import: parse markdown into `root` (cleared first), tables handled by `splitOutTables`. */
+/**
+ * Import: parse markdown into `root` (cleared first), tables handled by
+ * `splitOutTables`. Each non-table chunk is parsed with
+ * `$generateNodesFromMarkdownString`, which — unlike
+ * `$convertFromMarkdownString` — returns nodes without touching any tree,
+ * so appending several chunks' results in a row (around each table) doesn't
+ * have each call clear out what the previous one just appended.
+ */
 export function markdownToNodes(root: ElementNode, markdown: string): void {
   root.clear();
   for (const part of splitOutTables(markdown)) {
     if (part.kind === "table") {
       root.append(buildTableNode(part.rows));
-    } else {
-      $convertFromMarkdownString(part.text, TRANSFORMERS, root, true);
+    } else if (part.text.length > 0) {
+      const nodes = $generateNodesFromMarkdownString(part.text, TRANSFORMERS, true);
+      for (const node of nodes) root.append(node);
     }
   }
   if (root.getChildrenSize() === 0) {
@@ -197,46 +221,34 @@ export function markdownToNodes(root: ElementNode, markdown: string): void {
   }
 }
 
-/** Export: serialize `root` to markdown, re-inlining any table nodes at their position. */
+/**
+ * Table export, unlike import, needs none of `splitOutTables`' line-based
+ * pre-processing: `$convertToMarkdownString` walks the already-structured
+ * node tree and hands each top-level node to its matching transformer, so a
+ * table's `export()` can just return its GFM markdown directly — the
+ * library's own inline-formatting serialization (bold/italic/links/etc
+ * inside surrounding paragraphs) keeps working normally alongside it. Only
+ * `replace` (import) is a no-op here; table import goes through
+ * `splitOutTables` in `markdownToNodes` instead.
+ */
+const TABLE_EXPORT: ElementTransformer = {
+  dependencies: [TableNode, TableRowNode, TableCellNode],
+  export: (node) => ($isTableNode(node) ? tableToMarkdown(node) : null),
+  regExp: /^(?!)$/, // never matches on import; see docstring above
+  replace: () => false,
+  type: "element",
+};
+
+/** Export: serialize `root` to markdown, tables included via `TABLE_EXPORT`. */
 export function nodesToMarkdown(root: ElementNode): string {
-  const children = root.getChildren();
-  if (!children.some((child) => $isTableNode(child))) {
-    return $convertToMarkdownString(TRANSFORMERS, root, true);
-  }
-
-  const chunks: string[] = [];
-  let run: LexicalNode[] = [];
-  const flushRun = () => {
-    for (const node of run) chunks.push(exportBlockToMarkdown(node));
-    run = [];
-  };
-
-  for (const child of children) {
-    if ($isTableNode(child)) {
-      flushRun();
-      const md = tableToMarkdown(child);
-      if (md) chunks.push(md);
-    } else {
-      run.push(child);
-    }
-  }
-  flushRun();
-  return chunks.filter((c) => c.length > 0).join("\n\n");
-}
-
-function exportBlockToMarkdown(node: LexicalNode): string {
-  for (const transformer of TRANSFORMERS) {
-    if (transformer.type !== "element") continue;
-    const result = transformer.export(node, (n) => n.getTextContent());
-    if (result != null) return result;
-  }
-  return node.getTextContent();
+  return $convertToMarkdownString(TRANSFORMERS, root, true);
 }
 
 export const TRANSFORMERS: Transformer[] = [
   NOTICE,
   IMAGE,
   VIDEO,
+  TABLE_EXPORT,
   CHECK_LIST,
   ...ELEMENT_TRANSFORMERS,
   CODE,
