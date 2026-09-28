@@ -2,6 +2,7 @@
   "name": "lightbook-lexical",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "Shared Lexical editor core for Lightbook: Outline-style rich text nodes, Google-Docs-style comments and suggesting, Loro CRDT realtime collaboration.",
   "type": "module",
   "main": "src/index.ts",

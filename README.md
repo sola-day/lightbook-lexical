@@ -149,3 +149,7 @@ corepack pnpm build
 - Underline/subscript/superscript round-trip through Pandoc-style
   `++text++`/`~text~`/`^text^` delimiters rather than CommonMark syntax
   (which doesn't define any) — see `src/markdown.ts`.
+
+## License
+
+[Apache License 2.0](./LICENSE)
