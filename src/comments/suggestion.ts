@@ -1,12 +1,14 @@
 import {
   $createRangeSelection,
   $createTextNode,
+  $getNodeByKey,
   $getRoot,
   $hasUpdateTag,
   $isTextNode,
   $setSelection,
   HISTORIC_TAG,
   TextNode,
+  type ElementNode,
   type LexicalEditor,
   type LexicalNode,
   type NodeKey,
@@ -45,6 +47,38 @@ function walkNode(node: LexicalNode, visit: (node: LexicalNode) => void) {
 }
 
 /**
+ * Merges consecutive plain-text sibling children of `parent` that share the
+ * same format/style/mode/detail back into one TextNode. Called on the
+ * parent(s) touched by `resolve()` (unwrapping/removing a suggestion mark
+ * exposes its former neighbors as new adjacent siblings) so an editing
+ * session with many accepted/rejected suggestions doesn't permanently leave
+ * the tree fragmented into ever-smaller TextNodes from `splitText` — with
+ * no merge step, every resolved suggestion would be a net-additive split
+ * that never gets undone, and both this controller's own diffing and
+ * generic tree walks (markdown export, `listThreads`, etc.) get slower as
+ * fragment count grows with document age rather than document size.
+ */
+function coalesceAdjacentTextNodes(parent: ElementNode) {
+  let child = parent.getFirstChild();
+  while (child) {
+    const next: LexicalNode | null = child.getNextSibling();
+    if (
+      $isTextNode(child) &&
+      $isTextNode(next) &&
+      child.getFormat() === next.getFormat() &&
+      child.getStyle() === next.getStyle() &&
+      child.getMode() === next.getMode() &&
+      child.getDetail() === next.getDetail()
+    ) {
+      child.setTextContent(child.getTextContent() + next.getTextContent());
+      next.remove();
+      continue; // re-check the grown node against its new next sibling
+    }
+    child = next;
+  }
+}
+
+/**
  * Google-Docs-style "Suggesting" mode.
  *
  * Lexical has no ProseMirror-style step/transaction pipeline to intercept
@@ -77,6 +111,27 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
   let active: SuggestingActive | null = null;
   let isResolving = false; // true while accept/reject's own editor.update runs
   const prevTextCache = new Map<NodeKey, string>();
+  // suggestion mark id (e.g. "si:sg-...") -> the MarkNode key(s) carrying
+  // it. Every suggestion MarkNode is created in exactly one place (the
+  // transform below) and destroyed in exactly one place (`resolve`, which
+  // fully resolves — and so fully clears — a given suggestionId at once),
+  // so this can be kept in sync at those two call sites directly instead of
+  // deriving it from a mutation listener. That makes `resolve()` an O(marks
+  // for this id) lookup instead of an O(document size) tree walk, which
+  // matters once a long editing session has accumulated many resolved and
+  // pending suggestions. (This index only knows about marks created by
+  // *this* controller instance — fine today since suggestion/comment marks
+  // aren't yet synced over the Loro collab layer; would need to become
+  // mutation-listener-driven if/when they are.)
+  const idIndex = new Map<string, Set<NodeKey>>();
+  function indexAdd(id: string, key: NodeKey) {
+    let set = idIndex.get(id);
+    if (!set) {
+      set = new Set();
+      idIndex.set(id, set);
+    }
+    set.add(key);
+  }
 
   const unregisterTransform = editor.registerNodeTransform(TextNode, (node) => {
     if (!active || isResolving) return;
@@ -192,15 +247,19 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
 
     let insertMarkNode: MarkNode | null = null;
     if (insertPart) {
-      insertMarkNode = $createMarkNode([suggestionInsertMarkId(suggestionId)]);
+      const insertId = suggestionInsertMarkId(suggestionId);
+      insertMarkNode = $createMarkNode([insertId]);
       insertPart.replace(insertMarkNode);
       insertMarkNode.append(insertPart);
+      indexAdd(insertId, insertMarkNode.getKey());
     }
 
     if (deletedText) {
-      const deleteMark = $createMarkNode([suggestionDeleteMarkId(suggestionId)]);
+      const deleteId = suggestionDeleteMarkId(suggestionId);
+      const deleteMark = $createMarkNode([deleteId]);
       const deleteTextNode = $createTextNode(deletedText);
       deleteMark.append(deleteTextNode);
+      indexAdd(deleteId, deleteMark.getKey());
       if (suffixPart) {
         suffixPart.insertBefore(deleteMark);
       } else if (insertMarkNode) {
@@ -237,16 +296,38 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       () => {
         const toUnwrap: MarkNode[] = [];
         const toRemove: MarkNode[] = [];
-        walkNode($getRoot(), (node) => {
-          if (!$isMarkNode(node)) return;
-          if (node.hasID(insertId)) {
-            (action === "accept" ? toUnwrap : toRemove).push(node);
-          } else if (node.hasID(deleteId)) {
-            (action === "accept" ? toRemove : toUnwrap).push(node);
+        const collect = (id: string, target: MarkNode[]) => {
+          const keys = idIndex.get(id);
+          if (!keys) return;
+          for (const key of keys) {
+            const node = $getNodeByKey(key);
+            if ($isMarkNode(node)) target.push(node);
           }
-        });
-        for (const node of toRemove) node.remove();
-        for (const node of toUnwrap) $unwrapMarkNode(node);
+        };
+        collect(insertId, action === "accept" ? toUnwrap : toRemove);
+        collect(deleteId, action === "accept" ? toRemove : toUnwrap);
+        // A suggestionId is always resolved (accepted/rejected) as a whole,
+        // atomically, right here — so once this update runs, no mark
+        // carrying either id can exist anymore, whether or not it was
+        // still in the index (e.g. never actually reached, see below).
+        // Clearing eagerly also means a caller that mistakenly resolves an
+        // already-resolved id a second time is a cheap no-op, not a stale
+        // lookup.
+        idIndex.delete(insertId);
+        idIndex.delete(deleteId);
+
+        const affectedParents = new Set<ElementNode>();
+        for (const node of toRemove) {
+          const parent = node.getParent();
+          if (parent) affectedParents.add(parent);
+          node.remove();
+        }
+        for (const node of toUnwrap) {
+          const parent = node.getParent();
+          if (parent) affectedParents.add(parent);
+          $unwrapMarkNode(node);
+        }
+        for (const parent of affectedParents) coalesceAdjacentTextNodes(parent);
       },
       // `discrete: true` so a caller reading editor state right after
       // accept/reject returns (as the example UI and the smoke tests both

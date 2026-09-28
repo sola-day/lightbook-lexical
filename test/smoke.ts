@@ -491,6 +491,100 @@ function markIdsOf(editor: ReturnType<typeof newEditor>) {
   );
 }
 
+// Accepting/rejecting a suggestion should merge the neighbors exposed by
+// unwrapping/removing its MarkNode back into one TextNode, instead of
+// leaving the tree permanently fragmented by the earlier splitText() calls
+// — see coalesceAdjacentTextNodes in suggestion.ts.
+{
+  const editor = newEditor();
+  editor.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("abcdef"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+
+  let suggestionId = "";
+  editor.update(
+    () => {
+      const textNode = ($getRoot().getFirstChild() as any).getFirstChild() as import("lexical").TextNode;
+      textNode.spliceText(2, 2, "", true); // delete "cd" from the middle -> pending suggestion_delete
+    },
+    { discrete: true }
+  );
+  editor.getEditorState().read(() => {
+    const walk = (node: any) => {
+      if ($isMarkNode(node)) {
+        const id = node.getIDs().find(isSuggestionDeleteMarkId);
+        if (id) suggestionId = id.slice("sd:".length);
+      }
+      if (typeof node.getChildren === "function") for (const c of node.getChildren()) walk(c);
+    };
+    walk($getRoot());
+  });
+
+  suggestion.acceptSuggestion(suggestionId);
+  ok(textOf(editor) === "abef", `accepting the deletion applies it (got ${JSON.stringify(textOf(editor))})`);
+
+  const childCount = editor.getEditorState().read(() => {
+    const p = $getRoot().getFirstChild() as any;
+    return p.getChildrenSize();
+  });
+  ok(
+    childCount === 1,
+    `accepting a suggestion coalesces the exposed neighbors back into a single text node instead of leaving them fragmented (paragraph has ${childCount} children)`
+  );
+}
+
+// resolve() must not silently no-op (or throw) on a suggestionId whose
+// marks were already resolved once — the id-index is deleted after the
+// first resolve, so a duplicate call has nothing to look up.
+{
+  const editor = newEditor();
+  editor.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("abc"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+
+  let suggestionId = "";
+  editor.update(
+    () => {
+      const textNode = ($getRoot().getFirstChild() as any).getFirstChild() as import("lexical").TextNode;
+      textNode.spliceText(3, 0, "XYZ", true);
+    },
+    { discrete: true }
+  );
+  editor.getEditorState().read(() => {
+    const walk = (node: any) => {
+      if ($isMarkNode(node)) {
+        const id = node.getIDs().find(isSuggestionInsertMarkId);
+        if (id) suggestionId = id.slice("si:".length);
+      }
+      if (typeof node.getChildren === "function") for (const c of node.getChildren()) walk(c);
+    };
+    walk($getRoot());
+  });
+
+  suggestion.acceptSuggestion(suggestionId);
+  ok(textOf(editor) === "abcXYZ", `first accept applies (got ${JSON.stringify(textOf(editor))})`);
+  suggestion.acceptSuggestion(suggestionId); // duplicate resolve of an already-resolved id
+  ok(textOf(editor) === "abcXYZ", `duplicate accept of an already-resolved id is a harmless no-op (got ${JSON.stringify(textOf(editor))})`);
+}
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
