@@ -2,8 +2,10 @@ import {
   $createRangeSelection,
   $createTextNode,
   $getRoot,
+  $hasUpdateTag,
   $isTextNode,
   $setSelection,
+  HISTORIC_TAG,
   TextNode,
   type LexicalEditor,
   type LexicalNode,
@@ -92,14 +94,43 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     // tagged as one atomic insertion, same as a paste.
     if (editor.isComposing()) return;
 
-    const parent = node.getParent();
-    if (
-      $isMarkNode(parent) &&
-      parent.getIDs().some((id) => isSuggestionInsertMarkId(id) || isSuggestionDeleteMarkId(id))
-    ) {
-      // Already inside a pending suggestion span: let edits here pass
-      // through for real (see docstring above) — just keep the cache
-      // current so a later edit elsewhere doesn't see a stale diff base.
+    // Undo/redo (and any other "historic" update, e.g. the history plugin's
+    // own coalesced restores) swaps in an old EditorState wholesale rather
+    // than applying an incremental edit. The reconciler then marks the
+    // restored TextNodes dirty — often under brand-new node keys the
+    // `prevTextCache` has never seen — so without this guard the diff below
+    // would read `prevText` as `""` and misread the entire restored text as
+    // a fresh insertion, wrapping it in a spurious new suggestion span
+    // every time the user hits Cmd+Z. Treat a historic update as "resync
+    // the baseline, don't diff it" instead: whatever the document looks
+    // like after undo/redo, accept it as the new starting point for future
+    // real edits (which is also what ProseMirror-style history/plugin-state
+    // coupling gets for free, and this doesn't).
+    if ($hasUpdateTag(HISTORIC_TAG)) {
+      prevTextCache.set(node.getKey(), node.getTextContent());
+      return;
+    }
+
+    // Already inside a pending suggestion span — possibly nested several
+    // MarkNodes deep, e.g. a comment placed on top of (or inside) an
+    // unresolved suggestion insert/delete — let edits here pass through for
+    // real (see docstring above) instead of double-wrapping them in another
+    // suggestion span. Walking through the whole contiguous MarkNode
+    // ancestor chain (not just the immediate parent) matters because
+    // comments and suggestions freely nest in either order: a comment can
+    // be added on selected text that's still a pending suggestion, and a
+    // suggestion-mode edit can land inside already-commented text (see
+    // `$wrapSelectionInMarkNode`'s nesting behavior in `plugin.ts`).
+    let ancestor: LexicalNode | null = node.getParent();
+    let insidePendingSuggestion = false;
+    while ($isMarkNode(ancestor)) {
+      if (ancestor.getIDs().some((id) => isSuggestionInsertMarkId(id) || isSuggestionDeleteMarkId(id))) {
+        insidePendingSuggestion = true;
+        break;
+      }
+      ancestor = ancestor.getParent();
+    }
+    if (insidePendingSuggestion) {
       prevTextCache.set(node.getKey(), node.getTextContent());
       return;
     }

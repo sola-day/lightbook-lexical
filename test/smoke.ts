@@ -1,9 +1,18 @@
 import { createHeadlessEditor } from "@lexical/headless";
-import { $getRoot, $getSelection, $isRangeSelection, $createParagraphNode, $createTextNode } from "lexical";
+import {
+  $getRoot,
+  $getSelection,
+  $isRangeSelection,
+  $createParagraphNode,
+  $createTextNode,
+  $createRangeSelection,
+  $setSelection,
+} from "lexical";
 import { $isMarkNode } from "@lexical/mark";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { markdownToNodes, nodesToMarkdown } from "../src/markdown";
 import { addComment, listThreads, removeComment } from "../src/comments/plugin";
+import { HISTORIC_TAG } from "lexical";
 import { createSuggestionController } from "../src/comments/suggestion";
 import { isSuggestionInsertMarkId, isSuggestionDeleteMarkId } from "../src/comments/ids";
 
@@ -352,6 +361,134 @@ function markIdsOf(editor: ReturnType<typeof newEditor>) {
 
   suggestion.rejectSuggestion(suggestionId);
   ok(textOf(editor) === "abcdef", `rejecting a deletion suggestion restores the text (got ${JSON.stringify(textOf(editor))})`);
+}
+
+// A "historic" update (undo/redo restoring an old EditorState onto
+// brand-new node keys) must not be misread as a fresh insertion by the
+// suggestion transform — see the $hasUpdateTag(HISTORIC_TAG) guard.
+{
+  const editor = newEditor();
+  editor.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("abc"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+
+  // Simulate what undo/redo actually does: swap in a whole new text node
+  // (a fresh, never-cached key) inside a `{ tag: HISTORIC_TAG }` update,
+  // the same way Lexical's own history restoration is tagged.
+  editor.update(
+    () => {
+      const root = $getRoot();
+      const p = root.getFirstChild() as any;
+      p.clear();
+      p.append($createTextNode("xyz"));
+    },
+    { discrete: true, tag: HISTORIC_TAG }
+  );
+
+  ok(textOf(editor) === "xyz", `historic update applies normally (got ${JSON.stringify(textOf(editor))})`);
+  ok(
+    markIdsOf(editor).every((ids) => !ids.some(isSuggestionInsertMarkId) && !ids.some(isSuggestionDeleteMarkId)),
+    "a historic (undo/redo) update is not tagged as a suggestion insert"
+  );
+}
+
+// Overlapping ranges: a comment placed on text that's still a pending
+// (unresolved) suggestion insertion. Further edits to that text should
+// pass through as real edits (not get wrapped in a second, nested
+// suggestion span) even though the immediate parent is now the comment's
+// MarkNode, not the suggestion's — see the ancestor-walk in suggestion.ts.
+{
+  const editor = newEditor();
+  editor.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("x"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+
+  editor.update(
+    () => {
+      const textNode = ($getRoot().getFirstChild() as any).getFirstChild() as import("lexical").TextNode;
+      textNode.spliceText(0, 1, "hello", true);
+    },
+    { discrete: true }
+  );
+  // The replaced "x" stays visually present as a struck-through pending
+  // suggestion_delete (see the earlier "deleted text ... is still present"
+  // test) — suggestion mode never actually removes text until resolved.
+  ok(textOf(editor) === "hellox", `typed text present before commenting (got ${JSON.stringify(textOf(editor))})`);
+  ok(
+    markIdsOf(editor).some((ids) => ids.some(isSuggestionInsertMarkId)),
+    "typed text is wrapped in a suggestion_insert mark before commenting"
+  );
+
+  // Comment the whole (still-pending) suggestion span.
+  editor.update(
+    () => {
+      const root = $getRoot();
+      const textNode = (() => {
+        let found: any = null;
+        const walk = (node: any) => {
+          if (node.getType?.() === "text" && node.getTextContent() === "hello") found = node;
+          if (typeof node.getChildren === "function") for (const c of node.getChildren()) walk(c);
+        };
+        walk(root);
+        return found;
+      })();
+      const selection = $createRangeSelection();
+      selection.anchor.set(textNode.getKey(), 0, "text");
+      selection.focus.set(textNode.getKey(), textNode.getTextContentSize(), "text");
+      $setSelection(selection);
+    },
+    { discrete: true }
+  );
+  addComment(editor, { threadId: "t1" });
+
+  const nestedBefore = markIdsOf(editor).filter(
+    (ids) => ids.some(isSuggestionInsertMarkId)
+  ).length;
+  ok(nestedBefore === 1, `exactly one suggestion_insert mark exists after nesting a comment on it (got ${nestedBefore})`);
+
+  // Now edit that same (comment-wrapped, still-pending-suggestion) text again.
+  editor.update(
+    () => {
+      const walk = (node: any): any => {
+        if (node.getType?.() === "text" && node.getTextContent() === "hello") return node;
+        if (typeof node.getChildren === "function") {
+          for (const c of node.getChildren()) {
+            const found = walk(c);
+            if (found) return found;
+          }
+        }
+        return null;
+      };
+      const textNode = walk($getRoot());
+      textNode.spliceText(textNode.getTextContentSize(), 0, " world", true);
+    },
+    { discrete: true }
+  );
+
+  ok(textOf(editor) === "hello worldx", `edit inside comment+suggestion nesting applies (got ${JSON.stringify(textOf(editor))})`);
+  const insertMarkCount = markIdsOf(editor).filter((ids) => ids.some(isSuggestionInsertMarkId)).length;
+  ok(
+    insertMarkCount === 1,
+    `editing text already inside a pending suggestion (nested under a comment) does not create a second, double-nested suggestion_insert mark (found ${insertMarkCount})`
+  );
 }
 
 console.log(`\n${passed} passed, ${failed} failed.`);
