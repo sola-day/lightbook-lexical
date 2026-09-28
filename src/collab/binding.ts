@@ -10,6 +10,7 @@ import {
 import { $isListNode } from "@lexical/list";
 import { lexicalNodeToBlockSpec, type BlockSpec } from "./blockSpec";
 import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
+import { BlockIdRegistry } from "./blockIdRegistry";
 
 const LORO_REMOTE_TAG = "lb-loro-remote-apply";
 const ROOT_ORDER_KEY = "rootOrder";
@@ -54,8 +55,12 @@ const BLOCKS_KEY = "blocks";
  *   - Blockquotes flatten to one text block (no nested multi-paragraph
  *     merge); tables sync as an opaque whole-node JSON snapshot
  *     (last-write-wins, no per-cell merge).
- *   - No remote cursor / presence layer yet (unlike the ProseMirror
- *     package's `CursorEphemeralStore`-based one).
+ *   - No collaborative undo/redo yet.
+ *
+ * Remote cursor / presence (who's editing where) is a separate optional
+ * layer on top of this binding — see `presence.ts` and `LoroCollabPlugin`'s
+ * `presence` prop, addressed with the same `{blockId, offset}` ids/text
+ * flattening this file uses for content.
  */
 export interface LoroBindingOptions {
   doc: LoroDoc;
@@ -63,26 +68,12 @@ export interface LoroBindingOptions {
 
 export interface LoroBinding {
   destroy(): void;
+  /** The block id a given Lexical node currently maps to, if any — for the presence layer (`presence.ts`). */
+  blockIdForNode(node: LexicalNode): string;
+  /** The current `NodeKey` a given block id maps to, if the doc still has it. */
+  nodeKeyForBlockId(id: string): NodeKey | undefined;
 }
 
-class BlockIdRegistry {
-  private keyToId = new Map<NodeKey, string>();
-
-  idFor(node: LexicalNode): string {
-    const key = node.getKey();
-    let id = this.keyToId.get(key);
-    if (!id) {
-      id = `b-${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
-      this.keyToId.set(key, id);
-    }
-    return id;
-  }
-
-  /** Called when rebuilding FROM Loro, so a reused (not freshly-created) Lexical node keeps its known id. */
-  bind(node: LexicalNode, id: string): void {
-    this.keyToId.set(node.getKey(), id);
-  }
-}
 
 function rootMap(doc: LoroDoc): LoroMap {
   return doc.getMap("lb");
@@ -311,6 +302,12 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     destroy() {
       unregisterUpdateListener();
       unsubscribeDoc();
+    },
+    blockIdForNode(node) {
+      return ids.idFor(node);
+    },
+    nodeKeyForBlockId(id) {
+      return ids.keyForId(id);
     },
   };
 }

@@ -80,9 +80,33 @@ algebra across all of them):
 - Blockquotes flatten to one text block (no per-paragraph merge inside a
   quote); tables sync as an opaque whole-node JSON snapshot (no per-cell
   merge).
-- No collaborative undo/redo yet, and no remote-cursor/presence layer
-  (unlike the ProseMirror package's `CursorEphemeralStore`-based one) — the
-  `HistoryPlugin` is simply disabled while collab is active for now.
+- No collaborative undo/redo yet — the `HistoryPlugin` is simply disabled
+  while collab is active for now.
+
+### Remote cursor / presence layer
+
+`src/collab/presence.ts` + `LoroCollabPlugin`'s optional `presence` prop
+render a colored caret + name label for where every other peer's cursor
+currently is, over Loro's `EphemeralStore` (a peer-keyed,
+per-entry-timeout-expiring key/value channel — not part of the CRDT
+document, nothing persisted — the Loro analogue of Yjs Awareness).
+
+Cursors are addressed the same way content is: `{blockId, offset}`, using
+the exact same block ids and text-flattening `binding.ts` uses for sync
+(`resolveLocalCursorPoint`/`readLocalCursorPayload` walk up to the nearest
+text-bearing block and flatten to one character offset, mirroring
+`blockSpec.ts`'s `textRunsOf`). Rendering resolves a remote `{blockId,
+offset}` back to a live DOM point via a `TreeWalker` over the target
+block's rendered text nodes; an offset past the block's current length
+(the block shrank since the broadcast) is clamped rather than left
+dangling, and a cursor on a block id that's since been deleted is dropped
+rather than crashing — see `test/collab.ts`'s presence tests.
+
+Scoped to a collapsed-caret position for v1, not a full remote-selection
+range highlight (unlike the ProseMirror package's decoration-based one) —
+the caret already gives strong "I can see where you are" feedback, and a
+correct multi-line range-highlight renderer was a large enough chunk of
+DOM work on its own to defer.
 
 See `src/collab/binding.ts`'s module docstring for the exact Loro document
 shape, and `test/collab.ts` for the tests that back these claims — including

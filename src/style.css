@@ -149,7 +149,7 @@
 }
 
 /* Remote collab cursors */
-.lb-remote-cursor { position: relative; border-left: 2px solid; margin-left: -1px; word-break: normal; pointer-events: none; }
+.lb-remote-cursor { position: relative; z-index: 18; border-left: 2px solid; margin-left: -1px; word-break: normal; pointer-events: none; }
 .lb-remote-cursor-label {
   position: absolute;
   top: -1.2em;

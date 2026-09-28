@@ -1,9 +1,10 @@
 import { createHeadlessEditor } from "@lexical/headless";
-import { $getRoot, $createParagraphNode, $createTextNode } from "lexical";
+import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey } from "lexical";
 import { LoroDoc } from "loro-crdt";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { createLoroBinding } from "../src/collab/binding";
 import { bridgeLoroDocs } from "../src/collab/bridge";
+import { createPresenceStore, setPresence, resolveLocalCursorPoint, resolveRemoteCursors } from "../src/collab/presence";
 
 let passed = 0;
 let failed = 0;
@@ -294,6 +295,65 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   );
 
   unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
+// --- Presence: local cursor resolves to {blockId, offset}, remote resolves back to a live node ---
+
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p1 = $createParagraphNode();
+      p1.append($createTextNode("hello"));
+      const p2 = $createParagraphNode();
+      p2.append($createTextNode("world"));
+      root.append(p1, p2);
+    },
+    { discrete: true }
+  );
+
+  let point: ReturnType<typeof resolveLocalCursorPoint> = null;
+  editorA.getEditorState().read(() => {
+    const secondParagraphText = ($getRoot().getChildren()[1] as any).getFirstChild();
+    point = resolveLocalCursorPoint(bindingA, secondParagraphText, 3); // "wor|ld"
+  });
+  ok(point !== null, "resolveLocalCursorPoint resolves a point inside the second paragraph");
+  ok((point as any)?.offset === 3, `offset within the block is 3, not accumulated across blocks (got ${(point as any)?.offset})`);
+
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+
+  const store = createPresenceStore();
+  const peerA = "peer-a";
+  setPresence(store, peerA, { user: { name: "Alice", color: "#4285f4" }, blockId: (point as any).blockId, offset: (point as any).offset });
+
+  const resolved = resolveRemoteCursors(editorB, bindingB, store, "peer-b");
+  ok(resolved.length === 1, `editor B resolves exactly one remote cursor (got ${resolved.length})`);
+  ok(resolved[0]?.offset === 3, `resolved remote offset matches what was broadcast (got ${resolved[0]?.offset})`);
+  editorB.getEditorState().read(() => {
+    const node = resolved[0] && $getNodeByKey(resolved[0].nodeKey);
+    ok(node?.getTextContent() === "world", `resolved remote node is editor B's own "world" paragraph (got ${JSON.stringify(node?.getTextContent())})`);
+  });
+
+  // Offset clamping: broadcast an offset past a block's current length (block shrank since the broadcast).
+  setPresence(store, peerA, { user: { name: "Alice", color: "#4285f4" }, blockId: (point as any).blockId, offset: 999 });
+  const clamped = resolveRemoteCursors(editorB, bindingB, store, "peer-b");
+  ok(clamped[0]?.offset === "world".length, `an out-of-range offset is clamped to the block's current length, not left dangling (got ${clamped[0]?.offset})`);
+
+  // A cursor on a block id that no longer exists anywhere is dropped, not crashed on.
+  setPresence(store, peerA, { user: { name: "Alice", color: "#4285f4" }, blockId: "b-does-not-exist", offset: 0 });
+  const dangling = resolveRemoteCursors(editorB, bindingB, store, "peer-b");
+  ok(dangling.length === 0, "a cursor on a deleted/unknown block id is dropped rather than crashing");
+
   bindingA.destroy();
   bindingB.destroy();
 }

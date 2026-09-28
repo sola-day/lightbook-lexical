@@ -14,6 +14,8 @@ import {
   LoroCollabPlugin,
   createLoroBinding,
   bridgeLoroDocs,
+  createPresenceStore,
+  bridgePresenceStores,
   type SuggestionController,
   type ThreadRange,
 } from "../src/index";
@@ -71,6 +73,13 @@ export default function App() {
     docB.import(docA.export({ mode: "snapshot" }));
     bridgeLoroDocs(docA, docB);
     return [docA, docB];
+  }, []);
+
+  const [presenceStoreA, presenceStoreB] = useMemo(() => {
+    const storeA = createPresenceStore();
+    const storeB = createPresenceStore();
+    bridgePresenceStores(storeA, storeB);
+    return [storeA, storeB];
   }, []);
 
   const editorARef = useRef<LexicalEditor | null>(null);
@@ -137,7 +146,8 @@ export default function App() {
         <p className="lb-hint">
           Type in either pane — each has its own <code>LoroDoc</code> peer, bridged in-memory via{" "}
           <code>createLoroBinding</code>. Text edits merge character-by-character even when made
-          concurrently in the same paragraph; see the README for what this "simple tier" binding
+          concurrently in the same paragraph; click into one pane and you'll see the other peer's
+          colored cursor label follow along. See the README for what this "simple tier" binding
           does and doesn't merge losslessly.
         </p>
         <div className="lb-collab-grid">
@@ -150,7 +160,12 @@ export default function App() {
                 key="collab-a"
                 namespace="lightbook-lexical-collab-a"
                 skipDefaultContent
-                collabPlugins={<LoroCollabPlugin doc={collabDocA} />}
+                collabPlugins={
+                  <LoroCollabPlugin
+                    doc={collabDocA}
+                    presence={{ store: presenceStoreA, peerId: "alice", user: { name: "Alice", color: "#4285f4" } }}
+                  />
+                }
               />
             </div>
           </div>
@@ -163,7 +178,12 @@ export default function App() {
                 key="collab-b"
                 namespace="lightbook-lexical-collab-b"
                 skipDefaultContent
-                collabPlugins={<LoroCollabPlugin doc={collabDocB} />}
+                collabPlugins={
+                  <LoroCollabPlugin
+                    doc={collabDocB}
+                    presence={{ store: presenceStoreB, peerId: "bob", user: { name: "Bob", color: "#ea4335" } }}
+                  />
+                }
               />
             </div>
           </div>

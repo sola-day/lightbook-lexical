@@ -1,21 +1,167 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
+import { $getSelection, SELECTION_CHANGE_COMMAND, COMMAND_PRIORITY_LOW } from "lexical";
 import type { LoroDoc } from "loro-crdt";
-import { createLoroBinding } from "./binding";
+import { createLoroBinding, type LoroBinding } from "./binding";
+import {
+  setPresence,
+  readLocalCursorPayload,
+  resolveRemoteCursors,
+  type PresenceState,
+  type PresenceUser,
+} from "./presence";
+import type { EphemeralStore } from "loro-crdt";
 
 export interface LoroCollabPluginProps {
   doc: LoroDoc;
+  /**
+   * Remote cursor / presence layer (optional — the editor works fine
+   * without it, just without the "who's editing where" carets). `store`
+   * is shared across peers the same way `doc` is (see
+   * `createPresenceStore`/`bridgePresenceStores`); `peerId` should be
+   * unique per peer (`doc.peerIdStr` is a reasonable default) and `user`
+   * is the local peer's displayed name/color.
+   */
+  presence?: {
+    store: EphemeralStore<PresenceState>;
+    peerId: string;
+    user: PresenceUser;
+  };
 }
 
-/** Drop this in `LightbookEditor`'s `collabPlugins` slot to wire the editor to a `LoroDoc`. */
-export function LoroCollabPlugin({ doc }: LoroCollabPluginProps) {
+/** Drop this in `LightbookEditor`'s `collabPlugins` slot to wire the editor to a `LoroDoc` (and, optionally, remote cursors). */
+export function LoroCollabPlugin({ doc, presence }: LoroCollabPluginProps) {
   const [editor] = useLexicalComposerContext();
+  const bindingRef = useRef<LoroBinding | null>(null);
 
   useEffect(() => {
     const binding = createLoroBinding(editor, { doc });
-    return () => binding.destroy();
+    bindingRef.current = binding;
+    return () => {
+      binding.destroy();
+      bindingRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, doc]);
+
+  useEffect(() => {
+    if (!presence) return;
+    const { store, peerId, user } = presence;
+    const binding = bindingRef.current;
+    if (!binding) return;
+
+    const host = editor.getRootElement()?.parentElement;
+    if (host) {
+      const computed = window.getComputedStyle(host);
+      if (computed.position === "static") host.style.position = "relative";
+    }
+
+    const cursorEls = new Map<string, { caret: HTMLElement; label: HTMLElement }>();
+
+    function broadcastLocal() {
+      editor.getEditorState().read(() => {
+        const selection = $getSelection();
+        const payload = selection ? readLocalCursorPayload(binding!, user) : null;
+        setPresence(store, peerId, payload);
+      });
+    }
+
+    function renderRemote() {
+      const rootEl = editor.getRootElement();
+      const hostEl = rootEl?.parentElement;
+      if (!rootEl || !hostEl) return;
+      const remotes = resolveRemoteCursors(editor, binding!, store, peerId);
+      const seen = new Set<string>();
+
+      for (const remote of remotes) {
+        seen.add(remote.peerId);
+        const el = editor.getElementByKey(remote.nodeKey);
+        if (!el) continue;
+
+        // Walk the block element's rendered text nodes to find the DOM
+        // point for `offset` characters in (same flattening blockSpec.ts
+        // uses for sync — see presence.ts's docstring).
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let remaining = remote.offset;
+        let point: { node: Node; offset: number } | null = null;
+        let current = walker.nextNode();
+        let last: Text | null = null;
+        while (current) {
+          const text = current as Text;
+          last = text;
+          const len = text.length;
+          if (remaining <= len) {
+            point = { node: text, offset: remaining };
+            break;
+          }
+          remaining -= len;
+          current = walker.nextNode();
+        }
+        if (!point && last) point = { node: last, offset: last.length };
+        if (!point) continue;
+
+        const range = document.createRange();
+        range.setStart(point.node, point.offset);
+        range.collapse(true);
+        const rect = range.getClientRects()[0] ?? range.getBoundingClientRect();
+        if (!rect || (rect.width === 0 && rect.height === 0 && rect.top === 0 && rect.left === 0)) continue;
+        const hostRect = hostEl.getBoundingClientRect();
+
+        let entry = cursorEls.get(remote.peerId);
+        if (!entry) {
+          const caret = document.createElement("span");
+          caret.className = "lb-remote-cursor";
+          const label = document.createElement("div");
+          label.className = "lb-remote-cursor-label";
+          caret.appendChild(label);
+          hostEl.appendChild(caret);
+          entry = { caret, label };
+          cursorEls.set(remote.peerId, entry);
+        }
+        entry.caret.style.position = "absolute";
+        entry.caret.style.top = `${rect.top - hostRect.top}px`;
+        entry.caret.style.left = `${rect.left - hostRect.left}px`;
+        entry.caret.style.height = `${rect.height || 18}px`;
+        entry.caret.style.borderColor = remote.user.color;
+        entry.label.style.backgroundColor = remote.user.color;
+        entry.label.textContent = remote.user.name;
+      }
+
+      for (const [peerId, entry] of cursorEls) {
+        if (!seen.has(peerId)) {
+          entry.caret.remove();
+          cursorEls.delete(peerId);
+        }
+      }
+    }
+
+    const unregisterSelectionCmd = editor.registerCommand(
+      SELECTION_CHANGE_COMMAND,
+      () => {
+        broadcastLocal();
+        return false;
+      },
+      COMMAND_PRIORITY_LOW
+    );
+    const unregisterUpdate = editor.registerUpdateListener(() => {
+      broadcastLocal();
+      renderRemote();
+    });
+    const unsubscribeStore = store.subscribe(() => renderRemote());
+
+    broadcastLocal();
+    renderRemote();
+
+    return () => {
+      unregisterSelectionCmd();
+      unregisterUpdate();
+      unsubscribeStore();
+      setPresence(store, peerId, null);
+      for (const entry of cursorEls.values()) entry.caret.remove();
+      cursorEls.clear();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, presence?.store, presence?.peerId]);
 
   return null;
 }
