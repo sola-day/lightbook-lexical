@@ -17,6 +17,31 @@ const ROOT_ORDER_KEY = "rootOrder";
 const BLOCKS_KEY = "blocks";
 
 /**
+ * `JSON.stringify` compares object key ORDER, not just content — and Loro
+ * does not preserve a plain object value's original key order when it
+ * round-trips through map storage (observed: `{text, formats}` written
+ * locally comes back as `{formats, text}`). A raw `JSON.stringify`
+ * equality check between a freshly-computed spec and a Loro-stored one is
+ * therefore unreliable — it can report "changed" for content that's
+ * actually identical. This recursively sorts object keys (arrays keep
+ * their order) before stringifying so the comparison is by content, not by
+ * incidental key order.
+ */
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, val) => {
+    if (val && typeof val === "object" && !Array.isArray(val)) {
+      return Object.keys(val)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, k) => {
+          acc[k] = (val as Record<string, unknown>)[k];
+          return acc;
+        }, {});
+    }
+    return val;
+  });
+}
+
+/**
  * Loro CRDT binding for lightbook-lexical — the "simple tier" from the
  * README's status table, not a full node-level binding like
  * lightbook-prosemirror's (which reuses the official `loro-prosemirror`
@@ -83,15 +108,15 @@ function rootMap(doc: LoroDoc): LoroMap {
 
 function writeAttrsAndText(block: LoroMap, spec: BlockSpec) {
   if (block.get("type") !== spec.type) block.set("type", spec.type);
-  const prevAttrsJSON = JSON.stringify(block.get("attrs") ?? null);
-  const nextAttrsJSON = JSON.stringify(spec.attrs ?? null);
+  const prevAttrsJSON = stableStringify(block.get("attrs") ?? null);
+  const nextAttrsJSON = stableStringify(spec.attrs ?? null);
   if (prevAttrsJSON !== nextAttrsJSON) block.set("attrs", spec.attrs as never);
 
   if (spec.text !== undefined) {
     const textContainer = block.ensureMergeableText("text");
     if (textContainer.toString() !== spec.text) textContainer.update(spec.text);
-    const prevRunsJSON = JSON.stringify(block.get("runs") ?? []);
-    const nextRunsJSON = JSON.stringify(spec.runs ?? []);
+    const prevRunsJSON = stableStringify(block.get("runs") ?? []);
+    const nextRunsJSON = stableStringify(spec.runs ?? []);
     if (prevRunsJSON !== nextRunsJSON) block.set("runs", (spec.runs ?? []) as never);
   }
 }
@@ -196,7 +221,19 @@ function readChildrenInto(
     if (textContainer != null && $isElementNode(node)) {
       const text = textContainer.toString();
       const runs = block.get("runs") as { text: string; formats: string[] }[] | undefined;
-      applyTextRuns(node, text, runs as never);
+      // `applyTextRuns` destructively `clear()`s and rebuilds the block's
+      // text children, which resets any local selection anchored inside
+      // it. `readChildrenInto` walks and re-applies EVERY block on every
+      // remote update (not just the one that actually changed), so
+      // without this guard, typing in paragraph 5 would reset a local
+      // cursor sitting in paragraph 1 too, every keystroke. Skip the
+      // rebuild when this block's own current content already matches.
+      const currentSpec = lexicalNodeToBlockSpec(node);
+      const textChanged = currentSpec?.text !== text;
+      const runsChanged = stableStringify(currentSpec?.runs ?? []) !== stableStringify(runs ?? []);
+      if (textChanged || runsChanged) {
+        applyTextRuns(node, text, runs as never);
+      }
     }
 
     const childOrder = block.get("childOrder") as LoroMovableList | undefined;

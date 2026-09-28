@@ -358,6 +358,71 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   bindingB.destroy();
 }
 
+// --- A remote edit to one block must not rebuild unrelated blocks ---------
+// (readChildrenInto used to unconditionally clear()+rebuild EVERY
+// text-bearing block's children on every remote update, which would reset
+// a local selection/cursor sitting in a completely untouched paragraph
+// every time anyone typed anywhere else. Verified here by checking that an
+// untouched paragraph's TextNode keeps the same NodeKey across a remote
+// update to a DIFFERENT paragraph — a stable key is what lets Lexical keep
+// a local selection anchored there intact.)
+
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p1 = $createParagraphNode();
+      p1.append($createTextNode("untouched"));
+      const p2 = $createParagraphNode();
+      p2.append($createTextNode("will change"));
+      root.append(p1, p2);
+    },
+    { discrete: true }
+  );
+
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  let keyBefore = "";
+  editorB.getEditorState().read(() => {
+    keyBefore = ($getRoot().getChildren()[0] as any).getFirstChild().getKey();
+  });
+
+  editorA.update(
+    () => {
+      const textNode = ($getRoot().getChildren()[1] as any).getFirstChild();
+      textNode.spliceText(0, 0, "it ", true);
+    },
+    { discrete: true }
+  );
+
+  ok(
+    textOf(editorB) === "untouched\n\nit will change",
+    `editor B received the edit to the second paragraph (got ${JSON.stringify(textOf(editorB))})`
+  );
+
+  let keyAfter = "";
+  editorB.getEditorState().read(() => {
+    keyAfter = ($getRoot().getChildren()[0] as any).getFirstChild().getKey();
+  });
+  ok(
+    keyAfter === keyBefore,
+    `the untouched first paragraph's TextNode keeps the same key across a remote edit to the second paragraph (before=${keyBefore}, after=${keyAfter})`
+  );
+
+  unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
