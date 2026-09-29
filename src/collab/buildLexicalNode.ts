@@ -1,4 +1,13 @@
-import { $createParagraphNode, $createTextNode, $parseSerializedNode, type ElementNode, type LexicalNode } from "lexical";
+import {
+  $createLineBreakNode,
+  $createParagraphNode,
+  $createTextNode,
+  $parseSerializedNode,
+  type ElementNode,
+  type LexicalNode,
+} from "lexical";
+import { $createLinkNode, type LinkNode } from "@lexical/link";
+import { $createMarkNode, type MarkNode } from "@lexical/mark";
 import { $createHeadingNode, $createQuoteNode, type HeadingTagType } from "@lexical/rich-text";
 import { $createCodeNode } from "@lexical/code";
 import { $createListNode, $createListItemNode, type ListType } from "@lexical/list";
@@ -23,11 +32,34 @@ export function applyTextRuns(element: ElementNode, text: string, runs: TextRun[
     if (text) element.append($createTextNode(text));
     return;
   }
+  // Consecutive runs sharing a link share one LinkNode, and within it,
+  // consecutive runs sharing the same mark ids share one MarkNode.
+  let link = null as { url: string; node: LinkNode } | null;
+  let mark = null as { key: string; node: MarkNode; parent: ElementNode } | null;
+
   for (const run of runs) {
     if (!run.text) continue;
-    const textNode = $createTextNode(run.text);
-    for (const format of run.formats) textNode.toggleFormat(format);
-    element.append(textNode);
+    const leaf = run.br ? $createLineBreakNode() : $createTextNode(run.text);
+    if (!run.br) for (const format of run.formats) (leaf as ReturnType<typeof $createTextNode>).toggleFormat(format);
+
+    if (run.link !== link?.url) {
+      link = run.link ? { url: run.link, node: $createLinkNode(run.link) } : null;
+      if (link) element.append(link.node);
+      mark = null;
+    }
+    const container: ElementNode = link?.node ?? element;
+
+    const markKey = run.marks?.length ? run.marks.join("\u0000") : "";
+    if (!markKey) {
+      mark = null;
+      container.append(leaf);
+      continue;
+    }
+    if (mark?.key !== markKey || mark.parent !== container) {
+      mark = { key: markKey, node: $createMarkNode(run.marks!), parent: container };
+      container.append(mark.node);
+    }
+    mark.node.append(leaf);
   }
 }
 

@@ -1,5 +1,7 @@
 import { createHeadlessEditor } from "@lexical/headless";
-import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey } from "lexical";
+import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey, $createLineBreakNode, $isLineBreakNode } from "lexical";
+import { $createLinkNode, $isLinkNode } from "@lexical/link";
+import { $createMarkNode, $isMarkNode } from "@lexical/mark";
 import { LoroDoc } from "loro-crdt";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { createLoroBinding } from "../src/collab/binding";
@@ -218,6 +220,91 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   });
   ok(hasBold, "bold formatting survives the Lexical -> Loro -> Lexical round-trip");
 
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
+// --- Inline elements (links, comment/suggestion marks, line breaks) keep their text ---
+// Regression: the binding used to read only a block's direct TextNode
+// children, so wrapping text in a comment mark (or a link) synced the block
+// as empty — wiping that text for every other peer.
+
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      const link = $createLinkNode("https://example.com/docs");
+      link.append($createTextNode("docs"));
+      const mark = $createMarkNode(["c:thread-1"]);
+      const bold = $createTextNode("this part");
+      bold.toggleFormat("bold");
+      mark.append(bold);
+      p.append($createTextNode("see "), link, $createTextNode(" and "), mark, $createLineBreakNode(), $createTextNode("end"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  const inspect = (editor: ReturnType<typeof newEditor>) => {
+    let out = { text: "", linkUrl: "", linkText: "", markIds: [] as string[], markText: "", markBold: false, breaks: 0 };
+    editor.getEditorState().read(() => {
+      const p = $getRoot().getFirstChild() as any;
+      out.text = p.getTextContent();
+      for (const child of p.getChildren()) {
+        if ($isLinkNode(child)) {
+          out.linkUrl = child.getURL();
+          out.linkText = child.getTextContent();
+        }
+        if ($isMarkNode(child)) {
+          out.markIds = child.getIDs();
+          out.markText = child.getTextContent();
+          out.markBold = (child.getFirstChild() as any)?.hasFormat?.("bold") ?? false;
+        }
+        if ($isLineBreakNode(child)) out.breaks++;
+      }
+    });
+    return out;
+  };
+
+  const b = inspect(editorB);
+  ok(b.text === "see docs and this part\nend", `text inside links/marks survives the round-trip (got ${JSON.stringify(b.text)})`);
+  ok(b.linkUrl === "https://example.com/docs" && b.linkText === "docs", `links are rebuilt with their URL (got ${JSON.stringify(b)})`);
+  ok(b.markIds.join() === "c:thread-1" && b.markText === "this part", "comment marks are rebuilt with their id and text");
+  ok(b.markBold, "formatting inside a mark survives");
+  ok(b.breaks === 1, "line breaks survive");
+
+  // A mark added live (the "Comment" action) reaches the peer without losing text.
+  editorA.update(
+    () => {
+      const p = $getRoot().getFirstChild() as any;
+      const last = p.getLastChild();
+      const mark = $createMarkNode(["c:thread-2"]);
+      last.insertBefore(mark);
+      mark.append(last);
+    },
+    { discrete: true }
+  );
+  const after = inspect(editorB);
+  ok(after.text === "see docs and this part\nend", `adding a mark live keeps the peer's text (got ${JSON.stringify(after.text)})`);
+  let ids: string[] = [];
+  editorB.getEditorState().read(() => {
+    for (const child of ($getRoot().getFirstChild() as any).getChildren()) if ($isMarkNode(child)) ids.push(...child.getIDs());
+  });
+  ok(ids.includes("c:thread-2"), `the live-added mark reaches the peer (got ${JSON.stringify(ids)})`);
+
+  unbridge();
   bindingA.destroy();
   bindingB.destroy();
 }

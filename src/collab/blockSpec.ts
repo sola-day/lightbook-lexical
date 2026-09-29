@@ -1,5 +1,6 @@
 import {
   $isElementNode,
+  $isLineBreakNode,
   $isParagraphNode,
   $isTextNode,
   type ElementNode,
@@ -7,6 +8,8 @@ import {
   type TextFormatType,
 } from "lexical";
 import { $isHeadingNode, $isQuoteNode } from "@lexical/rich-text";
+import { $isLinkNode } from "@lexical/link";
+import { $isMarkNode } from "@lexical/mark";
 import { $isListNode, $isListItemNode } from "@lexical/list";
 import { $isCodeNode } from "@lexical/code";
 import { $isTableNode } from "@lexical/table";
@@ -14,10 +17,19 @@ import { $isImageNode } from "../nodes/ImageNode";
 import { $isVideoNode } from "../nodes/VideoNode";
 import { $isNoticeNode } from "../nodes/NoticeNode";
 
-/** One inline formatted run, used to reconstruct a text-bearing block's formatting from a snapshot. */
+/**
+ * One inline formatted run, used to reconstruct a text-bearing block's
+ * inline structure from a snapshot. Inline element wrappers are flattened
+ * onto the runs they contain: `marks` are the enclosing `MarkNode` ids
+ * (comment threads and suggestions, see `src/comments/ids.ts`), `link` the
+ * enclosing link's URL, and `br` marks a `LineBreakNode` (its text is "\n").
+ */
 export interface TextRun {
   text: string;
   formats: TextFormatType[];
+  marks?: string[];
+  link?: string;
+  br?: true;
 }
 
 /**
@@ -47,17 +59,41 @@ const TRACKED_FORMATS: TextFormatType[] = [
   "highlight",
 ];
 
-function textRunsOf(element: ElementNode): { text: string; runs: TextRun[] } {
-  const runs: TextRun[] = [];
-  let text = "";
-  for (const child of element.getChildren()) {
+interface InlineContext {
+  marks: string[];
+  link?: string;
+}
+
+function collectRuns(children: LexicalNode[], ctx: InlineContext, runs: TextRun[]): void {
+  for (const child of children) {
     if ($isTextNode(child)) {
-      const formats = TRACKED_FORMATS.filter((f) => child.hasFormat(f));
-      runs.push({ text: child.getTextContent(), formats });
-      text += child.getTextContent();
+      const run: TextRun = { text: child.getTextContent(), formats: TRACKED_FORMATS.filter((f) => child.hasFormat(f)) };
+      if (ctx.marks.length) run.marks = [...ctx.marks];
+      if (ctx.link) run.link = ctx.link;
+      runs.push(run);
+    } else if ($isLineBreakNode(child)) {
+      const run: TextRun = { text: "\n", formats: [], br: true };
+      if (ctx.marks.length) run.marks = [...ctx.marks];
+      runs.push(run);
+    } else if ($isMarkNode(child)) {
+      collectRuns(child.getChildren(), { ...ctx, marks: [...ctx.marks, ...child.getIDs()] }, runs);
+    } else if ($isLinkNode(child)) {
+      collectRuns(child.getChildren(), { ...ctx, link: child.getURL() }, runs);
+    } else if ($isElementNode(child) && child.isInline()) {
+      collectRuns(child.getChildren(), ctx, runs);
     }
   }
-  return { text, runs };
+}
+
+/** Flattens a block's inline content (text, line breaks, and text inside marks/links) into `text` + `runs`. */
+function inlineRunsOf(children: LexicalNode[]): { text: string; runs: TextRun[] } {
+  const runs: TextRun[] = [];
+  collectRuns(children, { marks: [] }, runs);
+  return { text: runs.map((r) => r.text).join(""), runs };
+}
+
+function textRunsOf(element: ElementNode): { text: string; runs: TextRun[] } {
+  return inlineRunsOf(element.getChildren());
 }
 
 /**
@@ -94,16 +130,7 @@ export function lexicalNodeToBlockSpec(node: LexicalNode): BlockSpec | null {
   }
   if ($isListItemNode(node)) {
     const nestedList = node.getChildren().find((c) => $isListNode(c));
-    const inlineChildren = node.getChildren().filter((c) => !$isListNode(c));
-    let text = "";
-    const runs: TextRun[] = [];
-    for (const child of inlineChildren) {
-      if ($isTextNode(child)) {
-        const formats = TRACKED_FORMATS.filter((f) => child.hasFormat(f));
-        runs.push({ text: child.getTextContent(), formats });
-        text += child.getTextContent();
-      }
-    }
+    const { text, runs } = inlineRunsOf(node.getChildren().filter((c) => !$isListNode(c)));
     return {
       type: "listitem",
       attrs: { checked: node.getChecked() ?? null },
