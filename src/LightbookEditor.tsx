@@ -57,6 +57,15 @@ function ReadyPlugin({
   return null;
 }
 
+/** Follows the `editable` prop after mount (the composer's initial config only reads it once). */
+function EditablePlugin({ editable }: { editable: boolean }) {
+  const [editor] = useLexicalComposerContext();
+  useEffect(() => {
+    if (editor.isEditable() !== editable) editor.setEditable(editable);
+  }, [editor, editable]);
+  return null;
+}
+
 /**
  * Assembles a full lightbook-lexical editor: base rich-text nodes, tables,
  * lists/checklists, links, images/video/notices, Markdown initial content,
@@ -110,6 +119,7 @@ export function LightbookEditor({
         <SelectionToolbarPlugin onComment={onComment} />
         <BlockMenuPlugin />
         <ReadyPlugin onReady={onReady} />
+        <EditablePlugin editable={editable} />
         {onChange && <OnChangePlugin onChange={onChange} />}
         {collabPlugins}
       </div>
