@@ -108,6 +108,20 @@ function coalesceAdjacentTextNodes(parent: ElementNode) {
  * below — so backspacing your own unaccepted insertion really deletes it
  * instead of double-tagging it.
  */
+/** A pending single-id suggestion mark directly next to `node`, if any. */
+function adjacentSuggestionMark(
+  node: LexicalNode,
+  isKind: (id: string) => boolean,
+): { mark: MarkNode; side: "before" | "after" } | null {
+  const matches = (n: LexicalNode | null): n is MarkNode =>
+    $isMarkNode(n) && n.getIDs().length === 1 && isKind(n.getIDs()[0]);
+  const before = node.getPreviousSibling();
+  if (matches(before)) return { mark: before, side: "before" };
+  const after = node.getNextSibling();
+  if (matches(after)) return { mark: after, side: "after" };
+  return null;
+}
+
 export function createSuggestionController(editor: LexicalEditor): SuggestionController {
   let active: SuggestingActive | null = null;
   let isResolving = false; // true while accept/reject's own editor.update runs
@@ -247,7 +261,14 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     for (const part of parts) prevTextCache.set(part.getKey(), part.getTextContent());
 
     let insertMarkNode: MarkNode | null = null;
-    if (insertPart) {
+    // Typing continues a pending insertion: a keystroke landing right after
+    // (or before) an insert-suggestion joins it instead of starting its own.
+    const adjacentInsert = insertPart && !deletedText ? adjacentSuggestionMark(insertPart, isSuggestionInsertMarkId) : null;
+    if (insertPart && adjacentInsert) {
+      if (adjacentInsert.side === "before") adjacentInsert.mark.append(insertPart);
+      else adjacentInsert.mark.splice(0, 0, [insertPart]);
+      insertMarkNode = adjacentInsert.mark;
+    } else if (insertPart) {
       const insertId = suggestionInsertMarkId(suggestionId);
       insertMarkNode = $createMarkNode([insertId]);
       insertPart.replace(insertMarkNode);
@@ -255,7 +276,30 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       indexAdd(insertId, insertMarkNode.getKey());
     }
 
-    if (deletedText) {
+    // Repeated Backspace (or Delete) continues a pending deletion the same way.
+    const deleteNeighbor =
+      deletedText && isBackward && !suffixPart && prefixPart
+        ? prefixPart.getNextSibling()
+        : deletedText && isBackward && !prefixPart && suffixPart
+          ? suffixPart.getPreviousSibling()
+          : null;
+    const continuedDelete =
+      $isMarkNode(deleteNeighbor) && deleteNeighbor.getIDs().length === 1 && isSuggestionDeleteMarkId(deleteNeighbor.getIDs()[0])
+        ? deleteNeighbor
+        : null;
+
+    if (deletedText && continuedDelete) {
+      const deleteTextNode = $createTextNode(deletedText);
+      if (prefixPart) continuedDelete.splice(0, 0, [deleteTextNode]);
+      else continuedDelete.append(deleteTextNode);
+      prevTextCache.set(deleteTextNode.getKey(), deletedText);
+      if (prefixPart) {
+        const selection = $createRangeSelection();
+        selection.anchor.set(prefixPart.getKey(), prefixPart.getTextContentSize(), "text");
+        selection.focus.set(prefixPart.getKey(), prefixPart.getTextContentSize(), "text");
+        $setSelection(selection);
+      }
+    } else if (deletedText) {
       const deleteId = suggestionDeleteMarkId(suggestionId);
       const deleteMark = $createMarkNode([deleteId]);
       const deleteTextNode = $createTextNode(deletedText);

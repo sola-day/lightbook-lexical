@@ -591,6 +591,58 @@ function markIdsOf(editor: ReturnType<typeof newEditor>) {
   ok(textOf(editor) === "abcXYZ", `duplicate accept of an already-resolved id is a harmless no-op (got ${JSON.stringify(textOf(editor))})`);
 }
 
+// Typing character by character, and backspacing repeatedly, each extend one
+// suggestion rather than creating one per keystroke.
+{
+  const editor = newEditor();
+  editor.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("Hello world"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+
+  for (const ch of " again") {
+    editor.update(
+      () => {
+        const p = $getRoot().getFirstChild() as any;
+        const last = p.getLastDescendant() as import("lexical").TextNode;
+        // Lexical places the caret after the mark, so each keystroke becomes a sibling text node.
+        const next = $createTextNode(ch);
+        const topLevel = (last.getParent() === p ? last : last.getParent())!;
+        topLevel.insertAfter(next);
+      },
+      { discrete: true }
+    );
+  }
+  const typed = [...listSuggestions(editor).values()];
+  ok(typed.length === 1 && typed[0].inserted === " again", `keystrokes extend one insertion suggestion (got ${JSON.stringify(typed)})`);
+
+  suggestion.setSuggesting(null);
+  suggestion.acceptSuggestion(typed[0].suggestionId);
+  suggestion.setSuggesting("alice");
+
+  for (let i = 0; i < 3; i++) {
+    editor.update(
+      () => {
+        const p = $getRoot().getFirstChild() as any;
+        // the untouched plain text node that precedes any pending deletion
+        const plain = p.getChildren().find((c: any) => c.getType?.() === "text" && c.getTextContent().length > 0);
+        plain.spliceText(plain.getTextContentSize() - 1, 1, "", true);
+      },
+      { discrete: true }
+    );
+  }
+  const deleted = [...listSuggestions(editor).values()];
+  ok(deleted.length === 1 && deleted[0].deleted === "ain", `repeated backspace extends one deletion suggestion (got ${JSON.stringify(deleted)})`);
+}
+
 console.log(`\n${passed} passed, ${failed} failed.`);
 if (failed > 0) {
   process.exit(1);
