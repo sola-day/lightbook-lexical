@@ -35,6 +35,7 @@ import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
 import { BlockIdRegistry } from "./blockIdRegistry";
 
 const LORO_REMOTE_TAG = "lb-loro-remote-apply";
+const ROOT_KEY = "lb";
 const ROOT_ORDER_KEY = "rootOrder";
 const BLOCKS_KEY = "blocks";
 
@@ -121,11 +122,13 @@ export interface LoroBinding {
   blockIdForNode(node: LexicalNode): string;
   /** The current `NodeKey` a given block id maps to, if the doc still has it. */
   nodeKeyForBlockId(id: string): NodeKey | undefined;
+  /** How many node keys the id registry holds (diagnostics: should track the number of blocks). */
+  registeredIds(): number;
 }
 
 
 function rootMap(doc: LoroDoc): LoroMap {
-  return doc.getMap("lb");
+  return doc.getMap(ROOT_KEY);
 }
 
 // --- Lexical -> Loro ---------------------------------------------------
@@ -210,34 +213,47 @@ function reconcileOrder(list: LoroMovableList, targetIds: string[]) {
   }
 }
 
+/**
+ * Keys of the nodes an update touched: Lexical's dirty sets include every
+ * ancestor of a change, so a block whose key isn't here is unchanged
+ * (together with everything inside it). `null` means write everything.
+ */
+type Touched = Set<NodeKey> | null;
+
 function writeChildren(
   blocksMap: LoroMap,
   orderList: LoroMovableList,
   nodes: LexicalNode[],
   ids: BlockIdRegistry,
-  written: WrittenCache
+  written: WrittenCache,
+  touched: Touched
 ) {
   const currentIds: string[] = [];
   for (const node of nodes) {
+    const known = ids.knownId(node);
+    if (touched && known && !touched.has(node.getKey())) {
+      currentIds.push(known);
+      continue;
+    }
     const spec = lexicalNodeToBlockSpec(node);
     if (!spec) continue;
-    const id = ids.idFor(node);
+    const id = known ?? ids.idFor(node);
     currentIds.push(id);
     const block = childMap(blocksMap, id);
     writeAttrsAndText(id, block, spec, written);
     if (spec.children !== undefined) {
       const childOrder = childList(block, "childOrder");
-      writeChildren(blocksMap, childOrder, spec.children, ids, written);
+      writeChildren(blocksMap, childOrder, spec.children, ids, written, touched);
     }
   }
   reconcileOrder(orderList, currentIds);
 }
 
-function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry, written: WrittenCache) {
+function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry, written: WrittenCache, touched: Touched = null) {
   const lb = rootMap(doc);
   const orderList = lb.ensureMergeableMovableList(ROOT_ORDER_KEY);
   const blocksMap = lb.ensureMergeableMap(BLOCKS_KEY);
-  writeChildren(blocksMap, orderList, root.getChildren(), ids, written);
+  writeChildren(blocksMap, orderList, root.getChildren(), ids, written, touched);
   doc.commit({ origin: "lb-local-edit" });
 }
 
@@ -287,83 +303,118 @@ function isLoroDocEmpty(doc: LoroDoc): boolean {
   return !orderList || orderList.length === 0;
 }
 
-function readChildrenInto(
-  parent: ElementNode,
-  blocksMap: LoroMap,
-  orderList: LoroMovableList,
-  ids: BlockIdRegistry,
-  reuse: Map<string, LexicalNode>,
-  built: BuiltFrom
-) {
-  const targetIds = orderList.toArray() as string[];
+interface ReadContext {
+  blocksMap: LoroMap;
+  ids: BlockIdRegistry;
+  built: BuiltFrom;
+  /**
+   * Ids of the blocks whose own content (type, attrs, text, marks, child
+   * list) may have changed, from the Loro events; `null` checks every
+   * block. Unchanged blocks keep their nodes without being re-read.
+   */
+  changed: Set<string> | null;
+  /** Nodes already placed in this pass (guards against an id listed twice). */
+  placed: Set<NodeKey>;
+}
+
+function $readChildrenInto(parent: ElementNode, orderList: LoroMovableList, ctx: ReadContext) {
   const nextChildren: LexicalNode[] = [];
 
-  for (const id of targetIds) {
-    const block = blocksMap.get(id) as LoroMap | undefined;
+  for (const id of orderList.toArray() as string[]) {
+    const block = ctx.blocksMap.get(id) as LoroMap | undefined;
     if (!block) continue;
-    const type = (block.get("type") as string) ?? "paragraph";
-    const attrs = (block.get("attrs") as Record<string, unknown>) ?? {};
+    const key = ctx.ids.keyForId(id);
+    let node: LexicalNode | null | undefined = key ? $getNodeByKey(key) : null;
+    if (node && ctx.placed.has(node.getKey())) node = null;
 
-    // A reused node may be stale: a peer changed this block's type or attrs
-    // (checked a todo, resized an image, edited a table...). Update it in
-    // place when that's a simple setter, otherwise rebuild it.
-    let node = reuse.get(id);
-    if (node && !$matchesBlock(node, type, attrs, built) && !$updateAttrsInPlace(node, type, attrs, built)) node = undefined;
-    if (!node) {
-      node = createLexicalNodeForType(type, attrs);
-      ids.bind(node, id);
-      built.set(node.getKey(), `${type}:${attrsKey(attrs)}`);
-    }
+    if (!node || !ctx.changed || ctx.changed.has(id)) node = $readBlock(id, block, node, ctx);
+    ctx.placed.add(node.getKey());
     nextChildren.push(node);
 
-    const textContainer = block.get("text") as LoroText | undefined;
-    if (textContainer != null && $isElementNode(node)) {
-      const text = textContainer.toString();
-      // Code blocks are plain text; everything else carries its inline
-      // structure as marks (or, written before that, a legacy `runs` value).
-      const legacyRuns = block.get("runs") as TextRun[] | undefined;
-      const runs = type === "code" ? undefined : legacyRuns && !hasMarks(textContainer) ? legacyRuns : readRunMarks(textContainer);
-      // `applyTextRuns` destructively `clear()`s and rebuilds the block's
-      // text children, which resets any local selection anchored inside
-      // it. `readChildrenInto` walks and re-applies EVERY block on every
-      // remote update (not just the one that actually changed), so
-      // without this guard, typing in paragraph 5 would reset a local
-      // cursor sitting in paragraph 1 too, every keystroke. Skip the
-      // rebuild when this block's own current content already matches.
-      const currentSpec = lexicalNodeToBlockSpec(node);
-      const textChanged = currentSpec?.text !== text;
-      const runsChanged =
-        stableStringify(canonicalRuns(currentSpec?.runs ?? [])) !== stableStringify(canonicalRuns(runs ?? []));
-      if (textChanged || runsChanged) {
-        applyTextRuns(node, text, runs);
-      }
-    }
-
     const childOrder = block.get("childOrder") as LoroMovableList | undefined;
-    if (childOrder && $isElementNode(node)) {
-      readChildrenInto(node, blocksMap, childOrder, ids, reuse, built);
-    }
+    if (childOrder && $isElementNode(node)) $readChildrenInto(node, childOrder, ctx);
   }
 
-  const nextKeys = new Set(nextChildren.map((c) => c.getKey()));
-  for (const child of parent.getChildren()) {
-    if (!nextKeys.has(child.getKey())) child.remove();
+  $placeChildren(parent, nextChildren);
+}
+
+/** Brings one block's node up to date with the doc (type, attrs, text, marks), creating it if needed. */
+function $readBlock(id: string, block: LoroMap, existing: LexicalNode | null | undefined, ctx: ReadContext): LexicalNode {
+  const type = (block.get("type") as string) ?? "paragraph";
+  const attrs = (block.get("attrs") as Record<string, unknown>) ?? {};
+
+  // A reused node may be stale: a peer changed this block's type or attrs
+  // (checked a todo, resized an image, edited a table...). Update it in
+  // place when that's a simple setter, otherwise rebuild it.
+  let node = existing;
+  if (node && !$matchesBlock(node, type, attrs, ctx.built) && !$updateAttrsInPlace(node, type, attrs, ctx.built)) node = null;
+  if (!node) {
+    node = createLexicalNodeForType(type, attrs);
+    ctx.ids.bind(node, id);
+    ctx.built.set(node.getKey(), `${type}:${attrsKey(attrs)}`);
   }
-  // `append()` on an already-attached child moves it, so replaying
-  // `nextChildren` in order both inserts new nodes and fixes ordering for
-  // reused ones in a single pass.
-  for (const child of nextChildren) {
-    parent.append(child);
+
+  const textContainer = block.get("text") as LoroText | undefined;
+  if (textContainer != null && $isElementNode(node)) {
+    const text = textContainer.toString();
+    // Code blocks are plain text; everything else carries its inline
+    // structure as marks (or, written before that, a legacy `runs` value).
+    const legacyRuns = block.get("runs") as TextRun[] | undefined;
+    const runs = type === "code" ? undefined : legacyRuns && !hasMarks(textContainer) ? legacyRuns : readRunMarks(textContainer);
+    // `applyTextRuns` destructively rebuilds the block's inline children,
+    // resetting a local caret inside it: skip it when nothing differs.
+    const currentSpec = lexicalNodeToBlockSpec(node);
+    const textChanged = currentSpec?.text !== text;
+    const runsChanged = stableStringify(canonicalRuns(currentSpec?.runs ?? [])) !== stableStringify(canonicalRuns(runs ?? []));
+    if (textChanged || runsChanged) applyTextRuns(node, text, runs);
+  }
+  return node;
+}
+
+/**
+ * Makes `parent`'s children exactly `next`, moving only what's out of
+ * place: re-appending every child would mark every block dirty, and Lexical
+ * would re-render the whole document on each remote keystroke.
+ */
+function $placeChildren(parent: ElementNode, next: LexicalNode[]) {
+  const current = parent.getChildren();
+  if (current.length === next.length && current.every((child, i) => child.is(next[i]))) return;
+
+  const keep = new Set(next.map((n) => n.getKey()));
+  for (const child of current) if (!keep.has(child.getKey())) child.remove();
+  for (let i = 0; i < next.length; i++) {
+    const at = parent.getChildAtIndex(i);
+    if (at?.is(next[i])) continue;
+    if (at) at.insertBefore(next[i]);
+    else parent.append(next[i]);
   }
 }
 
-function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>, built: BuiltFrom) {
+/** The block ids a batch of Loro events touched, or `null` when it can't tell (then every block is checked). */
+function changedBlockIds(batch: LoroEventBatch): Set<string> | null {
+  const changed = new Set<string>();
+  for (const event of batch.events) {
+    const path = event.path;
+    if (path[0] !== ROOT_KEY) return null;
+    if (path[1] !== BLOCKS_KEY) continue; // block order lists: structure only
+    if (path.length >= 3) {
+      changed.add(String(path[2]));
+    } else if (event.diff.type === "map") {
+      for (const id of Object.keys(event.diff.updated)) changed.add(id);
+    } else {
+      return null;
+    }
+  }
+  return changed;
+}
+
+function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, built: BuiltFrom, changed: Set<string> | null) {
   const lb = rootMap(doc);
   const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
   const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
   const root = $getRoot();
   if (orderList && blocksMap) {
-    readChildrenInto(root, blocksMap, orderList, ids, reuse, built);
+    $readChildrenInto(root, orderList, { blocksMap, ids, built, changed, placed: new Set() });
   } else {
     // No containers at all (e.g. undoing a page's very first edit removed
     // them): an empty page.
@@ -382,10 +433,10 @@ function readLoroToLexical(
   editor: LexicalEditor,
   doc: LoroDoc,
   ids: BlockIdRegistry,
-  reuse: Map<string, LexicalNode>,
-  built: BuiltFrom
+  built: BuiltFrom,
+  changed: Set<string> | null
 ) {
-  editor.update(() => $applyLoroToLexical(doc, ids, reuse, built), { tag: REMOTE_APPLY_TAGS, discrete: true });
+  editor.update(() => $applyLoroToLexical(doc, ids, built, changed), { tag: REMOTE_APPLY_TAGS, discrete: true });
 }
 
 // --- Caret <-> {blockId, offset} (for undo/redo) -------------------------
@@ -419,23 +470,6 @@ function readCaretIn(state: EditorState, ids: BlockIdRegistry): BlockCaret | nul
   return state.read(() => $readCaret(ids));
 }
 
-/** Rebuilds `reuse` (id -> current Lexical node) by walking the live tree, so the next Loro->Lexical pass can update nodes in place instead of recreating them (which would lose local cursor/DOM state). */
-function rebuildReuseMap(editor: LexicalEditor, ids: BlockIdRegistry): Map<string, LexicalNode> {
-  const reuse = new Map<string, LexicalNode>();
-  editor.getEditorState().read(() => {
-    const walk = (node: LexicalNode) => {
-      // Only nodes the binding created/bound carry a known id; harmless to
-      // skip ones that don't (e.g. before the first sync pass).
-      reuse.set(ids.idFor(node), node);
-      if ($isElementNode(node)) {
-        for (const child of node.getChildren()) walk(child);
-      }
-    };
-    for (const child of $getRoot().getChildren()) walk(child);
-  });
-  return reuse;
-}
-
 /**
  * Wires a `LexicalEditor` to a `LoroDoc` bidirectionally. Call once per
  * editor instance. If the doc already has content, the editor adopts it
@@ -445,7 +479,6 @@ function rebuildReuseMap(editor: LexicalEditor, ids: BlockIdRegistry): Map<strin
 export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOptions): LoroBinding {
   const { doc } = options;
   const ids = new BlockIdRegistry();
-  let reuse = new Map<string, LexicalNode>();
   const built: BuiltFrom = new Map();
   const written: WrittenCache = new Map();
   configureTextStyles(doc);
@@ -480,10 +513,26 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
       },
       { discrete: true }
     );
-    reuse = rebuildReuseMap(editor, ids);
   } else {
-    readLoroToLexical(editor, doc, ids, reuse, built);
-    reuse = rebuildReuseMap(editor, ids);
+    readLoroToLexical(editor, doc, ids, built, null);
+  }
+
+  // Node keys of blocks that were deleted or rebuilt pile up in the id
+  // registry and caches; drop them now and then (one walk per many updates).
+  let updatesSincePrune = 0;
+  function maybePrune() {
+    if (++updatesSincePrune < 500) return;
+    updatesSincePrune = 0;
+    const live = new Set<NodeKey>();
+    editor.getEditorState().read(() => {
+      const walk = (node: LexicalNode) => {
+        live.add(node.getKey());
+        if ($isElementNode(node)) for (const child of node.getChildren()) walk(child);
+      };
+      walk($getRoot());
+    });
+    ids.prune(live);
+    for (const key of built.keys()) if (!live.has(key)) built.delete(key);
   }
 
   // Undo/redo (see the file docstring). Each undo step remembers where the
@@ -530,7 +579,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
       applyingHistory = false;
     }
     for (const tag of REMOTE_APPLY_TAGS) $addUpdateTag(tag);
-    $applyLoroToLexical(doc, ids, reuse, built);
+    $applyLoroToLexical(doc, ids, built, null);
     if (caretAfterHistory) $restoreCaret(caretAfterHistory, ids);
     return true;
   }
@@ -539,25 +588,22 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
   const unregisterRedo = editor.registerCommand(REDO_COMMAND, () => $applyHistory("redo"), COMMAND_PRIORITY_EDITOR);
 
   const unregisterUpdateListener = editor.registerUpdateListener(({ tags, dirtyElements, dirtyLeaves, prevEditorState }) => {
-    if (tags.has(LORO_REMOTE_TAG)) {
-      reuse = rebuildReuseMap(editor, ids);
-      return;
-    }
+    maybePrune();
+    if (tags.has(LORO_REMOTE_TAG)) return;
     if (dirtyElements.size === 0 && dirtyLeaves.size === 0) return;
     caretBeforeEdit = readCaretIn(prevEditorState, ids);
+    const touched = new Set<NodeKey>([...dirtyElements.keys(), ...dirtyLeaves]);
     editor.getEditorState().read(() => {
       // Until the doc has content, the editor's lone empty paragraph is a
       // placeholder (see the seeding above), whatever else touched it.
       if (isLoroDocEmpty(doc) && $isPlaceholderOnly()) return;
-      writeLexicalToLoro(doc, $getRoot(), ids, written);
+      writeLexicalToLoro(doc, $getRoot(), ids, written, touched);
     });
-    reuse = rebuildReuseMap(editor, ids);
   });
 
   const unsubscribeDoc = doc.subscribe((event: LoroEventBatch) => {
     if (event.by === "local") return;
-    readLoroToLexical(editor, doc, ids, reuse, built);
-    reuse = rebuildReuseMap(editor, ids);
+    readLoroToLexical(editor, doc, ids, built, changedBlockIds(event));
   });
 
   return {
@@ -573,6 +619,9 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     },
     nodeKeyForBlockId(id) {
       return ids.keyForId(id);
+    },
+    registeredIds() {
+      return ids.size;
     },
   };
 }

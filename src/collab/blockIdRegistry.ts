@@ -31,4 +31,22 @@ export class BlockIdRegistry {
   keyForId(id: string): NodeKey | undefined {
     return this.idToKey.get(id);
   }
+
+  /** The node's id if it already has one (never allocates). */
+  knownId(node: LexicalNode): string | undefined {
+    return this.keyToId.get(node.getKey());
+  }
+
+  get size(): number {
+    return this.keyToId.size;
+  }
+
+  /** Forgets every node key not in `live` (nodes the editor has since destroyed). */
+  prune(live: Set<NodeKey>): void {
+    for (const [key, id] of this.keyToId) {
+      if (live.has(key)) continue;
+      this.keyToId.delete(key);
+      if (this.idToKey.get(id) === key) this.idToKey.delete(id);
+    }
+  }
 }

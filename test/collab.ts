@@ -851,6 +851,69 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   binding.destroy();
 }
 
+// --- Work scales with what changed, not with the document ----------------
+
+{
+  const BLOCKS = 300;
+  const editorA = newEditor();
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      for (let i = 0; i < BLOCKS; i++) {
+        const p = $createParagraphNode();
+        const t = $createTextNode(`paragraph ${i} `);
+        if (i % 3 === 0) t.toggleFormat("bold");
+        p.append(t, $createTextNode("tail"));
+        root.append(p);
+      }
+    },
+    { discrete: true }
+  );
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  let dirtyOnB: string[] = [];
+  const off = editorB.registerUpdateListener(({ dirtyElements }) => {
+    dirtyOnB = [...dirtyElements.keys()];
+  });
+  const typeInto = (editor: ReturnType<typeof newEditor>, index: number, text: string) =>
+    editor.update(
+      () => {
+        const last = ($getRoot().getChildAtIndex(index) as any).getLastChild();
+        last.setTextContent(last.getTextContent() + text);
+      },
+      { discrete: true }
+    );
+  typeInto(editorA, 150, "!");
+  let expected: string[] = [];
+  editorB.getEditorState().read(() => (expected = ["root", $getRoot().getChildAtIndex(150)!.getKey()]));
+  ok(
+    dirtyOnB.length <= 2 && dirtyOnB.every((k) => expected.includes(k)),
+    `a remote keystroke only dirties its own block on the other peer (dirtied ${dirtyOnB.length} elements)`
+  );
+  off();
+
+  const start = performance.now();
+  for (let i = 0; i < 100; i++) typeInto(editorA, i % BLOCKS, "x");
+  const perKeystroke = (performance.now() - start) / 100;
+  console.log(`      (${BLOCKS}-block doc, local keystroke + remote apply: ${perKeystroke.toFixed(2)} ms each)`);
+
+  ok(
+    bindingA.registeredIds() <= BLOCKS + 5 && bindingB.registeredIds() <= BLOCKS + 5,
+    `block ids are only kept for blocks (A ${bindingA.registeredIds()}, B ${bindingB.registeredIds()}, blocks ${BLOCKS})`
+  );
+
+  unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
 // --- Undo/redo go through Loro's UndoManager ---------------------------
 // With a collab binding there's no HistoryPlugin (it would restore whole old
 // EditorStates, reverting remote peers' edits too), so Cmd+Z used to do
