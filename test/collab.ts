@@ -1,11 +1,13 @@
 import { createHeadlessEditor } from "@lexical/headless";
-import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey, $createLineBreakNode, $isLineBreakNode } from "lexical";
+import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey, $createLineBreakNode, $isLineBreakNode, $getSelection, $isRangeSelection, UNDO_COMMAND, REDO_COMMAND } from "lexical";
 import { $createLinkNode, $isLinkNode } from "@lexical/link";
 import { $createMarkNode, $isMarkNode } from "@lexical/mark";
 import { LoroDoc } from "loro-crdt";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { createLoroBinding } from "../src/collab/binding";
 import { bridgeLoroDocs } from "../src/collab/bridge";
+import { createSuggestionController } from "../src/comments/suggestion";
+import { listSuggestions } from "../src/comments/plugin";
 import { createPresenceStore, setPresence, resolveLocalCursorPoint, resolveRemoteCursors } from "../src/collab/presence";
 
 let passed = 0;
@@ -508,6 +510,121 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   unbridge();
   bindingA.destroy();
   bindingB.destroy();
+}
+
+// --- Undo/redo go through Loro's UndoManager ---------------------------
+// With a collab binding there's no HistoryPlugin (it would restore whole old
+// EditorStates, reverting remote peers' edits too), so Cmd+Z used to do
+// nothing at all.
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function typeAtEnd(editor: ReturnType<typeof newEditor>, text: string) {
+  editor.update(
+    () => {
+      const p = $getRoot().getLastChild() as any;
+      const last = p.getLastDescendant?.() ?? null;
+      if (last && last.getType() === "text") {
+        last.select(last.getTextContentSize(), last.getTextContentSize());
+      } else {
+        p.selectEnd();
+      }
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) selection.insertText(text);
+    },
+    { discrete: true }
+  );
+}
+
+function caretOffset(editor: ReturnType<typeof newEditor>) {
+  let offset = -1;
+  editor.getEditorState().read(() => {
+    const selection = $getSelection();
+    if ($isRangeSelection(selection)) offset = selection.anchor.offset;
+  });
+  return offset;
+}
+
+function press(editor: ReturnType<typeof newEditor>, command: typeof UNDO_COMMAND) {
+  editor.update(() => void editor.dispatchCommand(command, undefined), { discrete: true });
+}
+
+{
+  const editor = newEditor();
+  const doc = new LoroDoc();
+  const binding = createLoroBinding(editor, { doc });
+  typeAtEnd(editor, "hello");
+  await pause(600); // past the undo merge interval: a separate step
+  typeAtEnd(editor, " world");
+  ok(textOf(editor) === "hello world", `typed two steps (got ${JSON.stringify(textOf(editor))})`);
+
+  press(editor, UNDO_COMMAND);
+  ok(textOf(editor) === "hello", `undo reverts the last step only (got ${JSON.stringify(textOf(editor))})`);
+  ok(caretOffset(editor) === 5, `undo puts the caret back where the edit started (got ${caretOffset(editor)})`);
+  press(editor, UNDO_COMMAND);
+  ok(textOf(editor) === "", `a second undo reverts the first step (got ${JSON.stringify(textOf(editor))})`);
+  press(editor, REDO_COMMAND);
+  press(editor, REDO_COMMAND);
+  ok(textOf(editor) === "hello world", `redo re-applies both steps (got ${JSON.stringify(textOf(editor))})`);
+  ok(caretOffset(editor) === 11, `redo puts the caret after the redone text (got ${caretOffset(editor)})`);
+
+  await pause(600);
+  typeAtEnd(editor, "!");
+  press(editor, UNDO_COMMAND);
+  ok(textOf(editor) === "hello world", `an edit after redo is its own undo step (got ${JSON.stringify(textOf(editor))})`);
+  binding.destroy();
+}
+
+// Undo only reverts this peer's own edits, never a collaborator's.
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+  typeAtEnd(editorA, "base");
+  const editorB = newEditor();
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  await pause(600);
+  typeAtEnd(editorA, " fromA");
+  typeAtEnd(editorB, " fromB");
+  ok(textOf(editorA) === "base fromA fromB", `both edits synced (got ${JSON.stringify(textOf(editorA))})`);
+
+  press(editorA, UNDO_COMMAND);
+  ok(textOf(editorA) === "base fromB", `A's undo removes only A's edit (got ${JSON.stringify(textOf(editorA))})`);
+  ok(textOf(editorB) === "base fromB", `B sees A's undo and keeps its own edit (got ${JSON.stringify(textOf(editorB))})`);
+
+  unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
+// Undo while suggesting reverts the suggestion instead of suggesting the undo.
+{
+  const editor = newEditor();
+  const doc = new LoroDoc();
+  const binding = createLoroBinding(editor, { doc });
+  typeAtEnd(editor, "draft");
+  await pause(600);
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+  typeAtEnd(editor, " more");
+  ok([...listSuggestions(editor).values()].some((s) => s.inserted === " more"), "suggesting: typed text is a pending insertion");
+
+  press(editor, UNDO_COMMAND);
+  ok(textOf(editor) === "draft", `undo while suggesting removes the suggested text (got ${JSON.stringify(textOf(editor))})`);
+  ok(listSuggestions(editor).size === 0, `undo leaves no stray suggestion behind (got ${JSON.stringify([...listSuggestions(editor).values()])})`);
+
+  press(editor, REDO_COMMAND);
+  const redone = [...listSuggestions(editor).values()];
+  ok(redone.length === 1 && redone[0].inserted === " more", `redo brings the suggestion back (got ${JSON.stringify(redone)})`);
+  suggestion.acceptSuggestion(redone[0].suggestionId);
+  ok(textOf(editor) === "draft more" && listSuggestions(editor).size === 0, `a suggestion rebuilt by redo can still be accepted (got ${JSON.stringify(textOf(editor))})`);
+
+  suggestion.destroy();
+  binding.destroy();
 }
 
 console.log(`\n${passed} passed, ${failed} failed.`);

@@ -80,8 +80,10 @@ algebra across all of them):
 - Blockquotes flatten to one text block (no per-paragraph merge inside a
   quote); tables sync as an opaque whole-node JSON snapshot (no per-cell
   merge).
-- No collaborative undo/redo yet — the `HistoryPlugin` is simply disabled
-  while collab is active for now.
+- Undo/redo in collab mode uses Loro's `UndoManager` instead of Lexical's
+  `HistoryPlugin`: only this peer's own edits are undone (a collaborator's
+  concurrent edits stay), steps typed within 500 ms merge, and the caret
+  returns to where the undone edit started.
 
 ### Remote cursor / presence layer
 

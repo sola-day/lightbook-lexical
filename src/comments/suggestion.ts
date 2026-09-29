@@ -1,7 +1,6 @@
 import {
   $createRangeSelection,
   $createTextNode,
-  $getNodeByKey,
   $getRoot,
   $getSelection,
   $hasUpdateTag,
@@ -13,6 +12,7 @@ import {
   DELETE_CHARACTER_COMMAND,
   DELETE_LINE_COMMAND,
   DELETE_WORD_COMMAND,
+  COLLABORATION_TAG,
   HISTORIC_TAG,
   TextNode,
   type RangeSelection,
@@ -173,28 +173,6 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
   let active: SuggestingActive | null = null;
   let isResolving = false; // true while accept/reject's own editor.update runs
   const prevTextCache = new Map<NodeKey, string>();
-  // suggestion mark id (e.g. "si:sg-...") -> the MarkNode key(s) carrying
-  // it. Every suggestion MarkNode is created in exactly one place (the
-  // transform below) and destroyed in exactly one place (`resolve`, which
-  // fully resolves — and so fully clears — a given suggestionId at once),
-  // so this can be kept in sync at those two call sites directly instead of
-  // deriving it from a mutation listener. That makes `resolve()` an O(marks
-  // for this id) lookup instead of an O(document size) tree walk, which
-  // matters once a long editing session has accumulated many resolved and
-  // pending suggestions. (This index only knows about marks created by
-  // *this* controller instance — fine today since suggestion/comment marks
-  // aren't yet synced over the Loro collab layer; would need to become
-  // mutation-listener-driven if/when they are.)
-  const idIndex = new Map<string, Set<NodeKey>>();
-  function indexAdd(id: string, key: NodeKey) {
-    let set = idIndex.get(id);
-    if (!set) {
-      set = new Set();
-      idIndex.set(id, set);
-    }
-    set.add(key);
-  }
-
   const unregisterTransform = editor.registerNodeTransform(TextNode, (node) => {
     if (!active || isResolving) return;
     if (!$isTextNode(node)) return;
@@ -223,7 +201,11 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     // like after undo/redo, accept it as the new starting point for future
     // real edits (which is also what ProseMirror-style history/plugin-state
     // coupling gets for free, and this doesn't).
-    if ($hasUpdateTag(HISTORIC_TAG)) {
+    //
+    // Content arriving from the Loro binding (a remote peer's edit, or this
+    // peer's own collaborative undo/redo) is tagged COLLABORATION_TAG and
+    // gets the same treatment: it's not local typing.
+    if ($hasUpdateTag(HISTORIC_TAG) || $hasUpdateTag(COLLABORATION_TAG)) {
       prevTextCache.set(node.getKey(), node.getTextContent());
       return;
     }
@@ -320,7 +302,6 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       insertMarkNode = $createMarkNode([insertId]);
       insertPart.replace(insertMarkNode);
       insertMarkNode.append(insertPart);
-      indexAdd(insertId, insertMarkNode.getKey());
     }
 
     // Repeated Backspace (or Delete) continues a pending deletion the same way.
@@ -351,7 +332,6 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       const deleteMark = $createMarkNode([deleteId]);
       const deleteTextNode = $createTextNode(deletedText);
       deleteMark.append(deleteTextNode);
-      indexAdd(deleteId, deleteMark.getKey());
       if (suffixPart) {
         suffixPart.insertBefore(deleteMark);
       } else if (insertMarkNode) {
@@ -415,7 +395,6 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
       mark = $createMarkNode([deleteId]);
       node.replace(mark);
       mark.append(node);
-      indexAdd(deleteId, mark.getKey());
     }
     remember(node);
     return mark;
@@ -557,27 +536,17 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     isResolving = true;
     editor.update(
       () => {
+        // Found by walking the tree rather than a key index: marks are
+        // recreated under new keys whenever the Loro binding rebuilds a
+        // block (remote edits, undo/redo), so remembered keys go stale.
         const toUnwrap: MarkNode[] = [];
         const toRemove: MarkNode[] = [];
-        const collect = (id: string, target: MarkNode[]) => {
-          const keys = idIndex.get(id);
-          if (!keys) return;
-          for (const key of keys) {
-            const node = $getNodeByKey(key);
-            if ($isMarkNode(node)) target.push(node);
-          }
-        };
-        collect(insertId, action === "accept" ? toUnwrap : toRemove);
-        collect(deleteId, action === "accept" ? toRemove : toUnwrap);
-        // A suggestionId is always resolved (accepted/rejected) as a whole,
-        // atomically, right here — so once this update runs, no mark
-        // carrying either id can exist anymore, whether or not it was
-        // still in the index (e.g. never actually reached, see below).
-        // Clearing eagerly also means a caller that mistakenly resolves an
-        // already-resolved id a second time is a cheap no-op, not a stale
-        // lookup.
-        idIndex.delete(insertId);
-        idIndex.delete(deleteId);
+        walkNode($getRoot(), (node) => {
+          if (!$isMarkNode(node)) return;
+          const ids = node.getIDs();
+          if (ids.includes(insertId)) (action === "accept" ? toUnwrap : toRemove).push(node);
+          else if (ids.includes(deleteId)) (action === "accept" ? toRemove : toUnwrap).push(node);
+        });
 
         const affectedParents = new Set<ElementNode>();
         for (const node of toRemove) {

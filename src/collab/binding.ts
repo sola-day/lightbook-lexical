@@ -1,11 +1,22 @@
-import type { LoroDoc, LoroEventBatch, LoroMovableList, LoroMap } from "loro-crdt";
+import { UndoManager, type Cursor, type LoroDoc, type LoroEventBatch, type LoroMovableList, type LoroMap, type LoroText } from "loro-crdt";
 import {
+  $addUpdateTag,
+  $getNodeByKey,
   $getRoot,
+  $getSelection,
   $isElementNode,
+  $isRangeSelection,
+  $isTextNode,
+  COLLABORATION_TAG,
+  COMMAND_PRIORITY_EDITOR,
+  REDO_COMMAND,
+  UNDO_COMMAND,
+  type EditorState,
   type ElementNode,
   type LexicalEditor,
   type LexicalNode,
   type NodeKey,
+  type PointType,
 } from "lexical";
 import { $isListNode } from "@lexical/list";
 import { lexicalNodeToBlockSpec, type BlockSpec } from "./blockSpec";
@@ -80,7 +91,11 @@ function stableStringify(value: unknown): string {
  *   - Blockquotes flatten to one text block (no nested multi-paragraph
  *     merge); tables sync as an opaque whole-node JSON snapshot
  *     (last-write-wins, no per-cell merge).
- *   - No collaborative undo/redo yet.
+ *
+ * Undo/redo goes through Loro's `UndoManager` rather than Lexical's
+ * `HistoryPlugin` (which would restore whole old EditorStates and so revert
+ * remote peers' concurrent edits too): only this peer's own commits are
+ * undone, and the result flows back into Lexical like a remote update.
  *
  * Remote cursor / presence (who's editing where) is a separate optional
  * layer on top of this binding — see `presence.ts` and `LoroCollabPlugin`'s
@@ -254,21 +269,106 @@ function readChildrenInto(
   }
 }
 
+function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>) {
+  const lb = rootMap(doc);
+  const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
+  const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
+  const root = $getRoot();
+  if (!orderList || !blocksMap) return;
+  readChildrenInto(root, blocksMap, orderList, ids, reuse);
+  if (root.getChildrenSize() === 0) {
+    root.append(createLexicalNodeForType("paragraph", {}));
+  }
+}
+
+// `COLLABORATION_TAG` lets other transforms (the suggestion controller)
+// tell content arriving from the CRDT apart from local typing.
+const REMOTE_APPLY_TAGS = [LORO_REMOTE_TAG, COLLABORATION_TAG];
+
 function readLoroToLexical(editor: LexicalEditor, doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>) {
-  editor.update(
-    () => {
-      const lb = rootMap(doc);
-      const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
-      const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
-      const root = $getRoot();
-      if (!orderList || !blocksMap) return;
-      readChildrenInto(root, blocksMap, orderList, ids, reuse);
-      if (root.getChildrenSize() === 0) {
-        root.append(createLexicalNodeForType("paragraph", {}));
+  editor.update(() => $applyLoroToLexical(doc, ids, reuse), { tag: REMOTE_APPLY_TAGS, discrete: true });
+}
+
+// --- Caret <-> {blockId, offset} (for undo/redo) -------------------------
+
+const TEXT_BEARING_TYPES = new Set(["paragraph", "heading", "quote", "code", "listitem"]);
+
+function $textBlockOf(node: LexicalNode): ElementNode | null {
+  let current: LexicalNode | null = node;
+  while (current && !($isElementNode(current) && TEXT_BEARING_TYPES.has(current.getType()))) current = current.getParent();
+  return current as ElementNode | null;
+}
+
+/** The block's inline leaves (text, line breaks, ...) in order, looking through marks and links but not nested blocks. */
+function $inlineLeaves(block: ElementNode): LexicalNode[] {
+  const out: LexicalNode[] = [];
+  const walk = (parent: ElementNode) => {
+    for (const child of parent.getChildren()) {
+      if ($isElementNode(child)) {
+        if (child.isInline()) walk(child);
+      } else {
+        out.push(child);
       }
-    },
-    { tag: LORO_REMOTE_TAG, discrete: true }
-  );
+    }
+  };
+  walk(block);
+  return out;
+}
+
+interface BlockCaret {
+  blockId: string;
+  /** Flattened character offset within the block's text (same units as `blockSpec.ts`'s `text`). */
+  offset: number;
+}
+
+function $caretOfPoint(point: PointType, ids: BlockIdRegistry): BlockCaret | null {
+  let node: LexicalNode = point.getNode();
+  let leafOffset = point.offset;
+  if ($isElementNode(node)) {
+    const child = node.getChildAtIndex(point.offset) ?? node.getLastChild();
+    const atEnd = point.offset >= node.getChildrenSize();
+    if (!child) {
+      const block = $textBlockOf(node);
+      return block ? { blockId: ids.idFor(block), offset: 0 } : null;
+    }
+    const leaf: LexicalNode | null = $isElementNode(child) ? (atEnd ? child.getLastDescendant() : child.getFirstDescendant()) : child;
+    if (!leaf) return null;
+    node = leaf;
+    leafOffset = atEnd ? leaf.getTextContentSize() : 0;
+  }
+  const block = $textBlockOf(node);
+  if (!block) return null;
+  let offset = 0;
+  for (const leaf of $inlineLeaves(block)) {
+    if (leaf.is(node)) return { blockId: ids.idFor(block), offset: offset + leafOffset };
+    offset += leaf.getTextContentSize();
+  }
+  return { blockId: ids.idFor(block), offset };
+}
+
+function $readCaret(ids: BlockIdRegistry): BlockCaret | null {
+  const selection = $getSelection();
+  return $isRangeSelection(selection) ? $caretOfPoint(selection.anchor, ids) : null;
+}
+
+function $restoreCaret(caret: BlockCaret, ids: BlockIdRegistry) {
+  const key = ids.keyForId(caret.blockId);
+  const block = key ? $getNodeByKey(key) : null;
+  if (!$isElementNode(block)) return;
+  let remaining = caret.offset;
+  for (const leaf of $inlineLeaves(block)) {
+    const size = leaf.getTextContentSize();
+    if ($isTextNode(leaf) && remaining <= size) {
+      leaf.select(remaining, remaining);
+      return;
+    }
+    remaining -= size;
+  }
+  block.selectEnd();
+}
+
+function readCaretIn(state: EditorState, ids: BlockIdRegistry): BlockCaret | null {
+  return state.read(() => $readCaret(ids));
 }
 
 /** Rebuilds `reuse` (id -> current Lexical node) by walking the live tree, so the next Loro->Lexical pass can update nodes in place instead of recreating them (which would lose local cursor/DOM state). */
@@ -320,9 +420,65 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     reuse = rebuildReuseMap(editor, ids);
   }
 
-  const unregisterUpdateListener = editor.registerUpdateListener(({ tags, dirtyElements, dirtyLeaves }) => {
-    if (tags.has(LORO_REMOTE_TAG)) return;
+  // Undo/redo (see the file docstring). Each undo step remembers where the
+  // caret was before the edit, as a Loro cursor so concurrent remote edits
+  // shift it along with the text; a redo step remembers where the caret was
+  // when it was undone.
+  let caretBeforeEdit: BlockCaret | null = null;
+  let applyingHistory = false;
+  let caretAfterHistory: BlockCaret | null = null;
+  const blockText = (blockId: string) =>
+    ((rootMap(doc).get(BLOCKS_KEY) as LoroMap | undefined)?.get(blockId) as LoroMap | undefined)?.get("text") as
+      | LoroText
+      | undefined;
+  const undoManager = new UndoManager(doc, {
+    mergeInterval: 500,
+    maxUndoSteps: 200,
+    onPush: (isUndo) => {
+      const caret = applyingHistory || !isUndo ? $readCaret(ids) : caretBeforeEdit;
+      if (!caret) return { value: null, cursors: [] };
+      const cursor = blockText(caret.blockId)?.getCursor(caret.offset);
+      return { value: caret as never, cursors: cursor ? [cursor] : [] };
+    },
+    onPop: (_isUndo, { value, cursors }) => {
+      const caret = value as unknown as BlockCaret | null;
+      if (!caret) return;
+      let offset = caret.offset;
+      try {
+        if (cursors[0]) offset = doc.getCursorPos(cursors[0] as Cursor)?.offset ?? offset;
+      } catch {
+        // The cursor's text no longer exists; keep the recorded offset.
+      }
+      caretAfterHistory = { blockId: caret.blockId, offset };
+    },
+  });
+
+  function $applyHistory(kind: "undo" | "redo"): boolean {
+    if (!(kind === "undo" ? undoManager.canUndo() : undoManager.canRedo())) return true;
+    caretAfterHistory = null;
+    applyingHistory = true;
+    try {
+      if (kind === "undo") undoManager.undo();
+      else undoManager.redo();
+    } finally {
+      applyingHistory = false;
+    }
+    for (const tag of REMOTE_APPLY_TAGS) $addUpdateTag(tag);
+    $applyLoroToLexical(doc, ids, reuse);
+    if (caretAfterHistory) $restoreCaret(caretAfterHistory, ids);
+    return true;
+  }
+
+  const unregisterUndo = editor.registerCommand(UNDO_COMMAND, () => $applyHistory("undo"), COMMAND_PRIORITY_EDITOR);
+  const unregisterRedo = editor.registerCommand(REDO_COMMAND, () => $applyHistory("redo"), COMMAND_PRIORITY_EDITOR);
+
+  const unregisterUpdateListener = editor.registerUpdateListener(({ tags, dirtyElements, dirtyLeaves, prevEditorState }) => {
+    if (tags.has(LORO_REMOTE_TAG)) {
+      reuse = rebuildReuseMap(editor, ids);
+      return;
+    }
     if (dirtyElements.size === 0 && dirtyLeaves.size === 0) return;
+    caretBeforeEdit = readCaretIn(prevEditorState, ids);
     editor.getEditorState().read(() => {
       writeLexicalToLoro(doc, $getRoot(), ids);
     });
@@ -338,7 +494,10 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
   return {
     destroy() {
       unregisterUpdateListener();
+      unregisterUndo();
+      unregisterRedo();
       unsubscribeDoc();
+      undoManager.free();
     },
     blockIdForNode(node) {
       return ids.idFor(node);
