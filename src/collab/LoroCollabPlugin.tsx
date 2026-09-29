@@ -58,15 +58,41 @@ export function LoroCollabPlugin({ doc, presence }: LoroCollabPluginProps) {
 
     const cursorEls = new Map<string, { caret: HTMLElement; label: HTMLElement }>();
 
+    // Only a real change of this peer's cursor is broadcast: every remote
+    // edit also runs the update listener below, and rebroadcasting an
+    // unchanged cursor for each one made presence traffic grow with the
+    // square of the number of collaborators. A periodic refresh keeps an
+    // idle cursor from expiring out of everyone's store.
+    let lastSent: string | undefined;
+    let lastPayload: ReturnType<typeof readLocalCursorPayload> = null;
     function broadcastLocal() {
       editor.getEditorState().read(() => {
         const selection = $getSelection();
         const payload = selection ? readLocalCursorPayload(binding!, user) : null;
+        const key = JSON.stringify(payload);
+        if (key === lastSent) return;
+        lastSent = key;
+        lastPayload = payload;
         setPresence(store, peerId, payload);
+      });
+    }
+    const refresh = setInterval(() => {
+      if (lastPayload) setPresence(store, peerId, lastPayload);
+    }, 10_000);
+
+    // Drawing measures layout, so it runs at most once per frame, and not
+    // at all while nobody else is here.
+    let frame = 0;
+    function scheduleRender() {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        renderRemote();
       });
     }
 
     function renderRemote() {
+      if (cursorEls.size === 0 && Object.keys(store.getAllStates()).every((id) => id === peerId)) return;
       const rootEl = editor.getRootElement();
       const hostEl = rootEl?.parentElement;
       if (!rootEl || !hostEl) return;
@@ -134,14 +160,16 @@ export function LoroCollabPlugin({ doc, presence }: LoroCollabPluginProps) {
     );
     const unregisterUpdate = editor.registerUpdateListener(() => {
       broadcastLocal();
-      renderRemote();
+      scheduleRender();
     });
-    const unsubscribeStore = store.subscribe(() => renderRemote());
+    const unsubscribeStore = store.subscribe(() => scheduleRender());
 
     broadcastLocal();
     renderRemote();
 
     return () => {
+      clearInterval(refresh);
+      cancelAnimationFrame(frame);
       unregisterSelectionCmd();
       unregisterUpdate();
       unsubscribeStore();
