@@ -10,6 +10,7 @@ import {
   KEY_ENTER_COMMAND,
   KEY_ESCAPE_COMMAND,
   KEY_TAB_COMMAND,
+  $isRootOrShadowRoot,
   type LexicalEditor,
   type RangeSelection,
 } from "lexical";
@@ -160,9 +161,17 @@ export function BlockMenuPlugin() {
         setSlash(detected);
 
         // Only element/decorator nodes get their own keyed DOM element in
-        // Lexical's reconciler, so look up the nearest top-level block.
-        const el = editor.getElementByKey(selection.anchor.getNode().getTopLevelElementOrThrow().getKey());
+        // Lexical's reconciler, so look up the nearest top-level block. The
+        // anchor can be the root itself (an element point on the root, e.g.
+        // while the document is still empty), which has no top-level block
+        // of its own: use the child at that point instead.
+        const anchorNode = selection.anchor.getNode();
+        const block = $isRootOrShadowRoot(anchorNode)
+          ? (anchorNode.getChildAtIndex(selection.anchor.offset) ?? anchorNode.getLastChild())
+          : anchorNode.getTopLevelElement();
+        const el = block ? editor.getElementByKey(block.getKey()) : null;
         const rootEl = editor.getRootElement();
+        if (!el) setHandleTop(null);
         if (el && rootEl) {
           const rect = el.getBoundingClientRect();
           const rootRect = rootEl.getBoundingClientRect();
