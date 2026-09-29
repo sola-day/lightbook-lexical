@@ -24,6 +24,7 @@
     "react-dom": "^19.0.0"
   },
   "dependencies": {
+    "@lexical/clipboard": "^0.51.0",
     "@lexical/code": "^0.51.0",
     "@lexical/link": "^0.51.0",
     "@lexical/list": "^0.51.0",

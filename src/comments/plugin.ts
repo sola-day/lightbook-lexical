@@ -2,6 +2,7 @@ import type { LexicalEditor, LexicalNode } from "lexical";
 import { $getRoot, $getSelection, $isRangeSelection } from "lexical";
 import { $wrapSelectionInMarkNode, $unwrapMarkNode, $isMarkNode, MarkNode } from "@lexical/mark";
 import {
+  SKIP_UNDO_TAG,
   commentMarkId,
   isCommentMarkId,
   isSuggestionInsertMarkId,
@@ -45,7 +46,7 @@ export function addComment(editor: LexicalEditor, { threadId }: AddCommentOption
       $wrapSelectionInMarkNode(selection, selection.isBackward(), commentMarkId(threadId));
       applied = true;
     },
-    { discrete: true }
+    { discrete: true, tag: SKIP_UNDO_TAG }
   );
   return applied;
 }
@@ -66,7 +67,7 @@ export function removeComment(editor: LexicalEditor, threadId: string): boolean 
         }
       });
     },
-    { discrete: true }
+    { discrete: true, tag: SKIP_UNDO_TAG }
   );
   return removed;
 }

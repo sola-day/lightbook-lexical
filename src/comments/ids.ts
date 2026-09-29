@@ -9,6 +9,13 @@
  * convention, read by the mutation-listener-driven styling in
  * `src/comments/styling.ts`.
  */
+/**
+ * Update tag for edits that must stay out of undo history. Comments are also
+ * server threads: undoing a comment's highlight would orphan its thread, and
+ * undoing an abandoned draft's removal would bring its highlight back.
+ */
+export const SKIP_UNDO_TAG = "lb-skip-undo";
+
 export const COMMENT_ID_PREFIX = "c:";
 export const SUGGESTION_INSERT_PREFIX = "si:";
 export const SUGGESTION_DELETE_PREFIX = "sd:";

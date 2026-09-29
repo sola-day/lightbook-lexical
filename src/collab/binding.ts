@@ -33,8 +33,12 @@ import { $flattenPoint, $locateFlatOffset } from "./caret";
 import { canonicalRuns, configureTextStyles, hasMarks, readRunMarks, writeRunMarks } from "./richText";
 import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
 import { BlockIdRegistry } from "./blockIdRegistry";
+import { SKIP_UNDO_TAG } from "../comments/ids";
 
 const LORO_REMOTE_TAG = "lb-loro-remote-apply";
+const LOCAL_EDIT_ORIGIN = "lb-local-edit";
+/** Commit origin of local edits tagged `SKIP_UNDO_TAG`; excluded from the UndoManager. */
+const SKIP_UNDO_ORIGIN = "lb-skip-undo";
 const ROOT_KEY = "lb";
 const ROOT_ORDER_KEY = "rootOrder";
 const BLOCKS_KEY = "blocks";
@@ -249,12 +253,19 @@ function writeChildren(
   reconcileOrder(orderList, currentIds);
 }
 
-function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry, written: WrittenCache, touched: Touched = null) {
+function writeLexicalToLoro(
+  doc: LoroDoc,
+  root: ElementNode,
+  ids: BlockIdRegistry,
+  written: WrittenCache,
+  touched: Touched = null,
+  origin = LOCAL_EDIT_ORIGIN
+) {
   const lb = rootMap(doc);
   const orderList = lb.ensureMergeableMovableList(ROOT_ORDER_KEY);
   const blocksMap = lb.ensureMergeableMap(BLOCKS_KEY);
   writeChildren(blocksMap, orderList, root.getChildren(), ids, written, touched);
-  doc.commit({ origin: "lb-local-edit" });
+  doc.commit({ origin });
 }
 
 // --- Loro -> Lexical ---------------------------------------------------
@@ -547,6 +558,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
       | LoroText
       | undefined;
   const undoManager = new UndoManager(doc, {
+    excludeOriginPrefixes: [SKIP_UNDO_ORIGIN],
     mergeInterval: 500,
     maxUndoSteps: 200,
     onPush: (isUndo) => {
@@ -591,13 +603,14 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     maybePrune();
     if (tags.has(LORO_REMOTE_TAG)) return;
     if (dirtyElements.size === 0 && dirtyLeaves.size === 0) return;
-    caretBeforeEdit = readCaretIn(prevEditorState, ids);
+    const skipUndo = tags.has(SKIP_UNDO_TAG);
+    if (!skipUndo) caretBeforeEdit = readCaretIn(prevEditorState, ids);
     const touched = new Set<NodeKey>([...dirtyElements.keys(), ...dirtyLeaves]);
     editor.getEditorState().read(() => {
       // Until the doc has content, the editor's lone empty paragraph is a
       // placeholder (see the seeding above), whatever else touched it.
       if (isLoroDocEmpty(doc) && $isPlaceholderOnly()) return;
-      writeLexicalToLoro(doc, $getRoot(), ids, written, touched);
+      writeLexicalToLoro(doc, $getRoot(), ids, written, touched, skipUndo ? SKIP_UNDO_ORIGIN : LOCAL_EDIT_ORIGIN);
     });
   });
 

@@ -10,7 +10,7 @@ import { LIGHTBOOK_NODES } from "../src/nodes";
 import { createLoroBinding } from "../src/collab/binding";
 import { bridgeLoroDocs } from "../src/collab/bridge";
 import { createSuggestionController } from "../src/comments/suggestion";
-import { listSuggestions } from "../src/comments/plugin";
+import { addComment, listSuggestions, listThreads, removeComment } from "../src/comments/plugin";
 import { createPresenceStore, setPresence, resolveLocalCursorPoint, resolveRemoteCursors } from "../src/collab/presence";
 
 let passed = 0;
@@ -1042,6 +1042,33 @@ function press(editor: ReturnType<typeof newEditor>, command: typeof UNDO_COMMAN
   ok(textOf(editor) === "draft more" && listSuggestions(editor).size === 0, `a suggestion rebuilt by redo can still be accepted (got ${JSON.stringify(textOf(editor))})`);
 
   suggestion.destroy();
+  binding.destroy();
+}
+
+// Comments live in a server thread as well as in the doc, so adding or
+// removing one isn't an undo step: undo skips over it to the edit before.
+{
+  const editor = newEditor();
+  const doc = new LoroDoc();
+  const binding = createLoroBinding(editor, { doc });
+  typeAtEnd(editor, "first");
+  await pause(600);
+  typeAtEnd(editor, " second");
+  await pause(600);
+  editor.update(() => ($getRoot().getFirstDescendant() as any).select(0, 5), { discrete: true });
+  addComment(editor, { threadId: "t1" });
+  ok(listThreads(editor).has("t1"), "the comment is anchored");
+
+  press(editor, UNDO_COMMAND);
+  ok(listThreads(editor).has("t1"), `undo keeps the comment (threads ${JSON.stringify([...listThreads(editor).keys()])})`);
+  ok(textOf(editor) === "first", `undo reverts the edit before the comment instead (got ${JSON.stringify(textOf(editor))})`);
+  press(editor, REDO_COMMAND);
+  ok(textOf(editor) === "first second" && listThreads(editor).has("t1"), `redo restores the edit, comment intact (got ${JSON.stringify(textOf(editor))})`);
+
+  removeComment(editor, "t1");
+  press(editor, UNDO_COMMAND);
+  ok(!listThreads(editor).has("t1"), "undo doesn't bring back a removed comment (e.g. an abandoned draft)");
+  ok(textOf(editor) === "first", `...it reverts the edit before it (got ${JSON.stringify(textOf(editor))})`);
   binding.destroy();
 }
 

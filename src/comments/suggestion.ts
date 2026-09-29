@@ -9,6 +9,8 @@ import {
   $isTextNode,
   $setSelection,
   COMMAND_PRIORITY_HIGH,
+  CUT_COMMAND,
+  CUT_TAG,
   DELETE_CHARACTER_COMMAND,
   DELETE_LINE_COMMAND,
   DELETE_WORD_COMMAND,
@@ -21,6 +23,7 @@ import {
   type LexicalNode,
   type NodeKey,
 } from "lexical";
+import { copyToClipboard } from "@lexical/clipboard";
 import { $createMarkNode, $isMarkNode, $unwrapMarkNode, MarkNode } from "@lexical/mark";
 import {
   isSuggestionDeleteMarkId,
@@ -150,6 +153,26 @@ function $leavesOf(element: ElementNode): LexicalNode[] {
     if (!$isElementNode(node)) leaves.push(node);
   });
   return leaves;
+}
+
+/**
+ * Runs `move` (which detaches and reattaches `node`) keeping any selection
+ * point that was inside `node` there. Detaching moves such points onto the
+ * parent element at the text offset, which is invalid for an element with
+ * fewer children: the caret would land at the start of a pasted or
+ * IME-composed insertion instead of after it.
+ */
+function $keepSelectionOn(node: TextNode, move: () => void) {
+  const selection = $getSelection();
+  const key = node.getKey();
+  const offsets = $isRangeSelection(selection)
+    ? [selection.anchor, selection.focus].map((p) => (p.type === "text" && p.key === key ? p.offset : null))
+    : [null, null];
+  move();
+  const after = $getSelection();
+  if (!$isRangeSelection(after)) return;
+  if (offsets[0] != null) after.anchor.set(key, offsets[0], "text");
+  if (offsets[1] != null) after.focus.set(key, offsets[1], "text");
 }
 
 /** Collapses the selection just outside `node` (before or after it). */
@@ -294,14 +317,21 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     // (or before) an insert-suggestion joins it instead of starting its own.
     const adjacentInsert = insertPart && !deletedText ? adjacentSuggestionMark(insertPart, isSuggestionInsertMarkId) : null;
     if (insertPart && adjacentInsert) {
-      if (adjacentInsert.side === "before") adjacentInsert.mark.append(insertPart);
-      else adjacentInsert.mark.splice(0, 0, [insertPart]);
+      const part = insertPart;
+      $keepSelectionOn(part, () => {
+        if (adjacentInsert.side === "before") adjacentInsert.mark.append(part);
+        else adjacentInsert.mark.splice(0, 0, [part]);
+      });
       insertMarkNode = adjacentInsert.mark;
     } else if (insertPart) {
+      const part = insertPart;
       const insertId = suggestionInsertMarkId(suggestionId);
-      insertMarkNode = $createMarkNode([insertId]);
-      insertPart.replace(insertMarkNode);
-      insertMarkNode.append(insertPart);
+      const mark = $createMarkNode([insertId]);
+      $keepSelectionOn(part, () => {
+        part.replace(mark);
+        mark.append(part);
+      });
+      insertMarkNode = mark;
     }
 
     // Repeated Backspace (or Delete) continues a pending deletion the same way.
@@ -528,6 +558,29 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     registerDeletion(DELETE_CHARACTER_COMMAND, "character"),
     registerDeletion(DELETE_WORD_COMMAND, "word"),
     registerDeletion(DELETE_LINE_COMMAND, "lineboundary"),
+    // Cut is copy + `removeText()` in @lexical/rich-text, which bypasses the
+    // deletion commands; a node it empties is removed outright and its text
+    // lost. Copy as usual, then strike the selection through instead.
+    editor.registerCommand(
+      CUT_COMMAND,
+      (event) => {
+        if (!active || isResolving || editor.isComposing()) return false;
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection) || selection.isCollapsed()) return false;
+        void copyToClipboard(editor, event instanceof ClipboardEvent ? event : null).then(() =>
+          editor.update(
+            () => {
+              const current = $getSelection();
+              if (!$isRangeSelection(current) || current.isCollapsed()) return;
+              if (!$suggestDeleteRange(current)) current.removeText(); // only your own pending insertions
+            },
+            { tag: CUT_TAG }
+          )
+        );
+        return true;
+      },
+      COMMAND_PRIORITY_HIGH,
+    ),
   ];
 
   function resolve(suggestionId: string, action: "accept" | "reject") {

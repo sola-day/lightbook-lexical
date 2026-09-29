@@ -12,7 +12,8 @@ import { $isMarkNode } from "@lexical/mark";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { markdownToNodes, nodesToMarkdown } from "../src/markdown";
 import { addComment, listSuggestions, listThreads, removeComment } from "../src/comments/plugin";
-import { HISTORIC_TAG, DELETE_CHARACTER_COMMAND } from "lexical";
+import { HISTORIC_TAG, DELETE_CHARACTER_COMMAND, CUT_COMMAND } from "lexical";
+import { registerRichText } from "@lexical/rich-text";
 import { createSuggestionController } from "../src/comments/suggestion";
 import { isSuggestionInsertMarkId, isSuggestionDeleteMarkId } from "../src/comments/ids";
 
@@ -714,6 +715,81 @@ for (const [initial, isBackward, caret, presses, expectDeleted] of [
   pressDelete(editor, true, 1);
   ok(textOf(editor) === "hello world", `deleting a selection keeps the text (got ${JSON.stringify(textOf(editor))})`);
   ok(JSON.stringify(deletedSuggestionTexts(editor)) === '["hello"]', `the selection becomes one deletion suggestion (got ${JSON.stringify(deletedSuggestionTexts(editor))})`);
+}
+
+// A multi-character insertion while suggesting (paste, an IME-composed word)
+// leaves the caret after the inserted text, not at its start.
+{
+  const editor = newEditor();
+  editor.update(() => {
+    const p = $createParagraphNode();
+    const t = $createTextNode("abc");
+    p.append(t);
+    $getRoot().clear().append(p);
+    t.select(3, 3);
+  }, { discrete: true });
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+  for (const [label, text] of [["at the end", "XYZ"], ["continuing it", "12"]] as const) {
+    editor.update(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection)) selection.insertText(text);
+    }, { discrete: true });
+    let caret = "";
+    editor.getEditorState().read(() => {
+      const selection = $getSelection();
+      if ($isRangeSelection(selection) && selection.isCollapsed()) {
+        const node = selection.anchor.getNode();
+        caret = `${selection.anchor.type}:${node.getTextContent()}@${selection.anchor.offset}`;
+      }
+    });
+    const inserted = [...listSuggestions(editor).values()].map((s) => s.inserted).join();
+    ok(caret === `text:${inserted}@${inserted.length}`, `multi-character insertion ${label}: caret ends after it (got ${caret}, inserted ${JSON.stringify(inserted)})`);
+  }
+  suggestion.destroy();
+}
+
+// Cmd+X while suggesting strikes the selection through instead of cutting it,
+// including a whole text node (Lexical removes an emptied node outright, so
+// the transform never sees it).
+{
+  // Lexical's cut path checks `event instanceof ClipboardEvent`; Node has none.
+  // Stubbed so the cut goes through its real path; headless there is no DOM
+  // selection, so the copy step copies nothing.
+  class ClipboardEvent {
+    clipboardData = null;
+    preventDefault() {}
+  }
+  (globalThis as any).ClipboardEvent ??= ClipboardEvent;
+  const cutEvent = () => new (globalThis as any).ClipboardEvent();
+  const editor = newEditor();
+  const unregisterRichText = registerRichText(editor);
+  editor.update(() => {
+    const p = $createParagraphNode();
+    const bold = $createTextNode("gone").toggleFormat("bold");
+    p.append($createTextNode("keep "), bold, $createTextNode(" tail"));
+    $getRoot().clear().append(p);
+    bold.select(0, 4);
+  }, { discrete: true });
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+  editor.dispatchCommand(CUT_COMMAND, cutEvent());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  ok(textOf(editor) === "keep gone tail", `cutting while suggesting keeps the text (got ${JSON.stringify(textOf(editor))})`);
+  ok(JSON.stringify(deletedSuggestionTexts(editor)) === '["gone"]', `the cut becomes one deletion suggestion (got ${JSON.stringify(deletedSuggestionTexts(editor))})`);
+
+  // Not suggesting: a cut really removes the text.
+  suggestion.setSuggesting(null);
+  editor.update(() => {
+    const p = $getRoot().getFirstChildOrThrow() as import("lexical").ElementNode;
+    const first = p.getFirstDescendant() as import("lexical").TextNode;
+    first.select(0, 4);
+  }, { discrete: true });
+  editor.dispatchCommand(CUT_COMMAND, cutEvent());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  ok(!textOf(editor).startsWith("keep"), `outside suggesting, cut still removes text (got ${JSON.stringify(textOf(editor))})`);
+  suggestion.destroy();
+  unregisterRichText();
 }
 
 console.log(`\n${passed} passed, ${failed} failed.`);
