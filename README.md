@@ -85,7 +85,10 @@ algebra across all of them):
 - Undo/redo in collab mode uses Loro's `UndoManager` instead of Lexical's
   `HistoryPlugin`: only this peer's own edits are undone (a collaborator's
   concurrent edits stay), steps typed within 500 ms merge, and the caret
-  returns to where the undone edit started.
+  returns to where the undone edit started. Updates tagged
+  `SKIP_UNDO_TAG` (exported from `lightbook-lexical/comments`) stay out
+  of undo history; `addComment`/`removeComment` use it, since a comment is
+  also a server-side thread that undo can't take back.
 
 ### Remote cursor / presence layer
 
@@ -143,11 +146,11 @@ corepack pnpm build
 
 ## Known scope limits (documented, not accidental)
 
-- Suggestion mode only rewrites edits that touch a single `TextNode`
-  (typing, backspace/delete, short in-place replacement) — matching
-  `lightbook-prosemirror`'s documented scope. Structurally larger edits
-  (multi-block, paste, list/table restructuring) apply normally,
-  untracked.
+- Suggestion mode tracks typing, paste and IME input within a block,
+  Backspace/Delete (character, word, line), and deleting or cutting a
+  selection (struck through; a cut still reaches the clipboard).
+  Structurally larger edits (splitting/merging blocks, pasting multiple
+  blocks, list/table restructuring) apply normally, untracked.
 - Table cells are treated as single-paragraph plain text on markdown
   import/export, same as the ProseMirror package.
 - Underline/subscript/superscript round-trip through Pandoc-style
