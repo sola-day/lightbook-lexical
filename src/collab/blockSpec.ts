@@ -5,6 +5,7 @@ import {
   $isTextNode,
   type ElementNode,
   type LexicalNode,
+  type SerializedLexicalNode,
   type TextFormatType,
 } from "lexical";
 import { $isHeadingNode, $isQuoteNode } from "@lexical/rich-text";
@@ -30,6 +31,23 @@ export interface TextRun {
   marks?: string[];
   link?: string;
   br?: true;
+  /** An inline image; its `text` is the single character `IMAGE_CHAR`. */
+  image?: InlineImage;
+}
+
+export interface InlineImage {
+  src: string;
+  alt?: string;
+  title?: string | null;
+  width?: number | null;
+}
+
+/** U+FFFC OBJECT REPLACEMENT CHARACTER: an inline image's one character in a block's synced text. */
+export const IMAGE_CHAR = "\uFFFC";
+
+/** A leaf's length in the synced text: text and line breaks count their characters, an inline image counts as `IMAGE_CHAR`. */
+export function inlineSize(node: LexicalNode): number {
+  return $isImageNode(node) ? 1 : node.getTextContentSize();
 }
 
 /**
@@ -75,6 +93,15 @@ function collectRuns(children: LexicalNode[], ctx: InlineContext, runs: TextRun[
       const run: TextRun = { text: "\n", formats: [], br: true };
       if (ctx.marks.length) run.marks = [...ctx.marks];
       runs.push(run);
+    } else if ($isImageNode(child)) {
+      const run: TextRun = {
+        text: IMAGE_CHAR,
+        formats: [],
+        image: { src: child.__src, alt: child.__alt, title: child.__title, width: child.__width },
+      };
+      if (ctx.marks.length) run.marks = [...ctx.marks];
+      if (ctx.link) run.link = ctx.link;
+      runs.push(run);
     } else if ($isMarkNode(child)) {
       collectRuns(child.getChildren(), { ...ctx, marks: [...ctx.marks, ...child.getIDs()] }, runs);
     } else if ($isLinkNode(child)) {
@@ -94,6 +121,13 @@ function inlineRunsOf(children: LexicalNode[]): { text: string; runs: TextRun[] 
 
 function textRunsOf(element: ElementNode): { text: string; runs: TextRun[] } {
   return inlineRunsOf(element.getChildren());
+}
+
+/** `exportJSON()` leaves `children` empty (the editor-state serializer fills them in); this fills them in too. */
+function exportDeep(node: LexicalNode): SerializedLexicalNode {
+  const json = node.exportJSON() as SerializedLexicalNode & { children?: SerializedLexicalNode[] };
+  if ($isElementNode(node)) json.children = node.getChildren().map(exportDeep);
+  return json;
 }
 
 /**
@@ -151,7 +185,7 @@ export function lexicalNodeToBlockSpec(node: LexicalNode): BlockSpec | null {
   if ($isTableNode(node)) {
     // Opaque: synced as a whole-node JSON snapshot, not merged cell-by-cell
     // (same "simple tier" trade as blockquote flattening above).
-    return { type: "table", attrs: { snapshot: node.exportJSON() } };
+    return { type: "table", attrs: { snapshot: exportDeep(node) } };
   }
   if (node.getType() === "horizontalrule") {
     return { type: "hr", attrs: {} };

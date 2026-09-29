@@ -18,8 +18,8 @@ import {
   type NodeKey,
   type PointType,
 } from "lexical";
-import { $isListNode } from "@lexical/list";
-import { lexicalNodeToBlockSpec, type BlockSpec } from "./blockSpec";
+import { $isListItemNode, $isListNode } from "@lexical/list";
+import { inlineSize, lexicalNodeToBlockSpec, type BlockSpec } from "./blockSpec";
 import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
 import { BlockIdRegistry } from "./blockIdRegistry";
 
@@ -202,6 +202,36 @@ function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistr
 
 // --- Loro -> Lexical ---------------------------------------------------
 
+/** Attrs as compared across peers: key order and null-vs-missing don't count as differences. */
+function attrsKey(attrs: unknown): string {
+  return JSON.stringify(JSON.parse(stableStringify(attrs ?? {})), (_key, val) => (val === null ? undefined : val));
+}
+
+/**
+ * Which stored `type`+`attrs` each node was last built or updated from. A
+ * node rebuilt from the doc doesn't always re-export byte-identical attrs
+ * (a table's import fills in defaults like `height: 0`), so "the doc still
+ * says what this node was built from" counts as a match too.
+ */
+type BuiltFrom = Map<NodeKey, string>;
+
+/** Whether a live node still is what the doc says this block is (same type and attrs). */
+function $matchesBlock(node: LexicalNode, type: string, attrs: Record<string, unknown>, built: BuiltFrom): boolean {
+  const stored = `${type}:${attrsKey(attrs)}`;
+  if (built.get(node.getKey()) === stored) return true;
+  const spec = lexicalNodeToBlockSpec(node);
+  return !!spec && `${spec.type}:${attrsKey(spec.attrs)}` === stored;
+}
+
+/** Applies an attrs-only change to a live node where that's a plain setter, keeping its key (and any caret in it). */
+function $updateAttrsInPlace(node: LexicalNode, type: string, attrs: Record<string, unknown>, built: BuiltFrom): boolean {
+  if (type === "listitem" && $isListItemNode(node)) {
+    node.setChecked((attrs.checked as boolean | null) ?? undefined);
+    return $matchesBlock(node, type, attrs, built);
+  }
+  return false;
+}
+
 /** True when every `blocksMap`/`orderList` entry referenced actually resolves — used to detect "empty doc". */
 function isLoroDocEmpty(doc: LoroDoc): boolean {
   const lb = rootMap(doc);
@@ -214,7 +244,8 @@ function readChildrenInto(
   blocksMap: LoroMap,
   orderList: LoroMovableList,
   ids: BlockIdRegistry,
-  reuse: Map<string, LexicalNode>
+  reuse: Map<string, LexicalNode>,
+  built: BuiltFrom
 ) {
   const targetIds = orderList.toArray() as string[];
   const nextChildren: LexicalNode[] = [];
@@ -225,10 +256,15 @@ function readChildrenInto(
     const type = (block.get("type") as string) ?? "paragraph";
     const attrs = (block.get("attrs") as Record<string, unknown>) ?? {};
 
+    // A reused node may be stale: a peer changed this block's type or attrs
+    // (checked a todo, resized an image, edited a table...). Update it in
+    // place when that's a simple setter, otherwise rebuild it.
     let node = reuse.get(id);
+    if (node && !$matchesBlock(node, type, attrs, built) && !$updateAttrsInPlace(node, type, attrs, built)) node = undefined;
     if (!node) {
       node = createLexicalNodeForType(type, attrs);
       ids.bind(node, id);
+      built.set(node.getKey(), `${type}:${attrsKey(attrs)}`);
     }
     nextChildren.push(node);
 
@@ -253,7 +289,7 @@ function readChildrenInto(
 
     const childOrder = block.get("childOrder") as LoroMovableList | undefined;
     if (childOrder && $isElementNode(node)) {
-      readChildrenInto(node, blocksMap, childOrder, ids, reuse);
+      readChildrenInto(node, blocksMap, childOrder, ids, reuse, built);
     }
   }
 
@@ -269,13 +305,13 @@ function readChildrenInto(
   }
 }
 
-function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>) {
+function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>, built: BuiltFrom) {
   const lb = rootMap(doc);
   const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
   const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
   const root = $getRoot();
   if (!orderList || !blocksMap) return;
-  readChildrenInto(root, blocksMap, orderList, ids, reuse);
+  readChildrenInto(root, blocksMap, orderList, ids, reuse, built);
   if (root.getChildrenSize() === 0) {
     root.append(createLexicalNodeForType("paragraph", {}));
   }
@@ -285,8 +321,14 @@ function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<stri
 // tell content arriving from the CRDT apart from local typing.
 const REMOTE_APPLY_TAGS = [LORO_REMOTE_TAG, COLLABORATION_TAG];
 
-function readLoroToLexical(editor: LexicalEditor, doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<string, LexicalNode>) {
-  editor.update(() => $applyLoroToLexical(doc, ids, reuse), { tag: REMOTE_APPLY_TAGS, discrete: true });
+function readLoroToLexical(
+  editor: LexicalEditor,
+  doc: LoroDoc,
+  ids: BlockIdRegistry,
+  reuse: Map<string, LexicalNode>,
+  built: BuiltFrom
+) {
+  editor.update(() => $applyLoroToLexical(doc, ids, reuse, built), { tag: REMOTE_APPLY_TAGS, discrete: true });
 }
 
 // --- Caret <-> {blockId, offset} (for undo/redo) -------------------------
@@ -334,14 +376,14 @@ function $caretOfPoint(point: PointType, ids: BlockIdRegistry): BlockCaret | nul
     const leaf: LexicalNode | null = $isElementNode(child) ? (atEnd ? child.getLastDescendant() : child.getFirstDescendant()) : child;
     if (!leaf) return null;
     node = leaf;
-    leafOffset = atEnd ? leaf.getTextContentSize() : 0;
+    leafOffset = atEnd ? inlineSize(leaf) : 0;
   }
   const block = $textBlockOf(node);
   if (!block) return null;
   let offset = 0;
   for (const leaf of $inlineLeaves(block)) {
     if (leaf.is(node)) return { blockId: ids.idFor(block), offset: offset + leafOffset };
-    offset += leaf.getTextContentSize();
+    offset += inlineSize(leaf);
   }
   return { blockId: ids.idFor(block), offset };
 }
@@ -357,7 +399,7 @@ function $restoreCaret(caret: BlockCaret, ids: BlockIdRegistry) {
   if (!$isElementNode(block)) return;
   let remaining = caret.offset;
   for (const leaf of $inlineLeaves(block)) {
-    const size = leaf.getTextContentSize();
+    const size = inlineSize(leaf);
     if ($isTextNode(leaf) && remaining <= size) {
       leaf.select(remaining, remaining);
       return;
@@ -398,6 +440,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
   const { doc } = options;
   const ids = new BlockIdRegistry();
   let reuse = new Map<string, LexicalNode>();
+  const built: BuiltFrom = new Map();
 
   if (isLoroDocEmpty(doc)) {
     editor.update(
@@ -416,7 +459,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     );
     reuse = rebuildReuseMap(editor, ids);
   } else {
-    readLoroToLexical(editor, doc, ids, reuse);
+    readLoroToLexical(editor, doc, ids, reuse, built);
     reuse = rebuildReuseMap(editor, ids);
   }
 
@@ -464,7 +507,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
       applyingHistory = false;
     }
     for (const tag of REMOTE_APPLY_TAGS) $addUpdateTag(tag);
-    $applyLoroToLexical(doc, ids, reuse);
+    $applyLoroToLexical(doc, ids, reuse, built);
     if (caretAfterHistory) $restoreCaret(caretAfterHistory, ids);
     return true;
   }
@@ -487,7 +530,7 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
 
   const unsubscribeDoc = doc.subscribe((event: LoroEventBatch) => {
     if (event.by === "local") return;
-    readLoroToLexical(editor, doc, ids, reuse);
+    readLoroToLexical(editor, doc, ids, reuse, built);
     reuse = rebuildReuseMap(editor, ids);
   });
 

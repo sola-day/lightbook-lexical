@@ -39,8 +39,8 @@ export function applyTextRuns(element: ElementNode, text: string, runs: TextRun[
 
   for (const run of runs) {
     if (!run.text) continue;
-    const leaf = run.br ? $createLineBreakNode() : $createTextNode(run.text);
-    if (!run.br) for (const format of run.formats) (leaf as ReturnType<typeof $createTextNode>).toggleFormat(format);
+    const leaf = run.br ? $createLineBreakNode() : run.image ? $createImageNode(run.image) : $createTextNode(run.text);
+    if (!run.br && !run.image) for (const format of run.formats) (leaf as ReturnType<typeof $createTextNode>).toggleFormat(format);
 
     if (run.link !== link?.url) {
       link = run.link ? { url: run.link, node: $createLinkNode(run.link) } : null;
@@ -78,13 +78,20 @@ export function createLexicalNodeForType(type: string, attrs: Record<string, unk
       return $createListNode((attrs.listType as ListType) ?? "bullet", (attrs.start as number) ?? 1);
     case "listitem":
       return $createListItemNode((attrs.checked as boolean | null) ?? undefined);
-    case "image":
-      return $createImageNode({
-        src: attrs.src as string,
-        alt: attrs.alt as string | undefined,
-        title: attrs.title as string | null | undefined,
-        width: attrs.width as number | null | undefined,
-      });
+    case "image": {
+      // Legacy top-level image block: images are inline, so it lives in a
+      // paragraph (which the next local edit writes back in the new shape).
+      const paragraph = $createParagraphNode();
+      paragraph.append(
+        $createImageNode({
+          src: attrs.src as string,
+          alt: attrs.alt as string | undefined,
+          title: attrs.title as string | null | undefined,
+          width: attrs.width as number | null | undefined,
+        })
+      );
+      return paragraph;
+    }
     case "video":
       return $createVideoNode({ src: attrs.src as string, title: attrs.title as string | null | undefined });
     case "notice":

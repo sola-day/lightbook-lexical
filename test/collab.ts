@@ -2,6 +2,9 @@ import { createHeadlessEditor } from "@lexical/headless";
 import { $getRoot, $createParagraphNode, $createTextNode, $getNodeByKey, $createLineBreakNode, $isLineBreakNode, $getSelection, $isRangeSelection, UNDO_COMMAND, REDO_COMMAND } from "lexical";
 import { $createLinkNode, $isLinkNode } from "@lexical/link";
 import { $createMarkNode, $isMarkNode } from "@lexical/mark";
+import { $createListNode, $createListItemNode } from "@lexical/list";
+import { $createTableNodeWithDimensions } from "@lexical/table";
+import { $createImageNode } from "../src/nodes/ImageNode";
 import { LoroDoc } from "loro-crdt";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { createLoroBinding } from "../src/collab/binding";
@@ -31,6 +34,15 @@ function newEditor() {
       throw error;
     },
   });
+}
+
+function tableTextOf(editor: ReturnType<typeof newEditor>) {
+  let text = "";
+  editor.getEditorState().read(() => {
+    const table = $getRoot().getChildren().find((n) => n.getType() === "table");
+    text = table ? table.getTextContent().trim() : "";
+  });
+  return text;
 }
 
 function textOf(editor: ReturnType<typeof newEditor>) {
@@ -510,6 +522,108 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   unbridge();
   bindingA.destroy();
   bindingB.destroy();
+}
+
+// --- Attribute-only changes to an existing block reach the other peer ---
+//
+// A peer that already has a block reuses its Lexical node on remote
+// updates; that reuse must not ignore a changed type/attrs (a checked todo,
+// a resized image, an edited table).
+
+{
+  const editorA = newEditor();
+  const docA = new LoroDoc();
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const list = $createListNode("check");
+      const item = $createListItemNode(false);
+      item.append($createTextNode("task"));
+      list.append(item);
+      const table = $createTableNodeWithDimensions(2, 2, false);
+      (table.getFirstDescendant()!.getParent() as ReturnType<typeof $createParagraphNode>).append($createTextNode("cell"));
+      const withImage = $createParagraphNode();
+      withImage.append($createTextNode("see "), $createImageNode({ src: "https://example.com/a.png", width: 100 }), $createTextNode(" here"));
+      root.append(list, withImage, table, $createParagraphNode());
+    },
+    { discrete: true }
+  );
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const unbridge = bridgeLoroDocs(docA, docB);
+
+  ok(tableTextOf(editorB) === "cell", `a table's cell content syncs to the other peer (got ${JSON.stringify(tableTextOf(editorB))})`);
+  let imageB: { src?: string; width?: unknown; around?: string } = {};
+  editorB.getEditorState().read(() => {
+    const p = $getRoot().getChildAtIndex(1) as any;
+    const img = p.getChildAtIndex(1);
+    imageB = { src: img?.__src, width: img?.__width, around: p.getTextContent() };
+  });
+  ok(
+    imageB.src === "https://example.com/a.png" && imageB.width === 100 && imageB.around === "see  here",
+    `an inline image syncs to the other peer in place (got ${JSON.stringify(imageB)})`
+  );
+
+  editorA.update(() => ($getRoot().getFirstChild() as any).getFirstChild().setChecked(true), { discrete: true });
+  let checked: boolean | undefined;
+  editorB.getEditorState().read(() => (checked = ($getRoot().getFirstChild() as any).getFirstChild().getChecked()));
+  ok(checked === true, `checking a todo on one peer checks it on the other (got ${checked})`);
+
+  editorA.update(() => (($getRoot().getChildAtIndex(1) as any).getChildAtIndex(1).getWritable().__width = 300), { discrete: true });
+  let width: unknown;
+  editorB.getEditorState().read(() => (width = ($getRoot().getChildAtIndex(1) as any).getChildAtIndex(1)?.__width));
+  ok(width === 300, `resizing an image on one peer resizes it on the other (got ${width})`);
+
+  editorA.update(
+    () => {
+      const cell = ($getRoot().getChildAtIndex(2) as any).getFirstDescendant();
+      cell.setTextContent("edited cell");
+    },
+    { discrete: true }
+  );
+  ok(tableTextOf(editorB) === "edited cell", `editing a table cell on one peer updates the other (got ${JSON.stringify(tableTextOf(editorB))})`);
+
+  // Nothing changed on B's side: a further unrelated remote edit must not rebuild B's unchanged blocks.
+  let keysBefore: string[] = [];
+  editorB.getEditorState().read(() => (keysBefore = $getRoot().getChildren().map((n) => n.getKey())));
+  editorA.update(() => ($getRoot().getLastChild() as any).append($createTextNode("typing")), { discrete: true });
+  let keysAfter: string[] = [];
+  editorB.getEditorState().read(() => (keysAfter = $getRoot().getChildren().map((n) => n.getKey())));
+  ok(JSON.stringify(keysBefore) === JSON.stringify(keysAfter), `unchanged blocks keep their nodes across an unrelated remote edit (${JSON.stringify(keysBefore)} -> ${JSON.stringify(keysAfter)})`);
+
+  unbridge();
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
+// --- A legacy top-level "image" block (written before images were inline) still renders ---
+
+{
+  const doc = new LoroDoc();
+  const lb = doc.getMap("lb");
+  const block = lb.ensureMergeableMap("blocks").ensureMergeableMap("img-1");
+  block.set("type", "image");
+  block.set("attrs", { src: "https://example.com/old.png", alt: "old" } as never);
+  lb.ensureMergeableMovableList("rootOrder").push("img-1");
+  doc.commit();
+
+  const editor = newEditor();
+  const binding = createLoroBinding(editor, { doc });
+  let src: string | undefined;
+  editor.getEditorState().read(() => (src = ($getRoot().getFirstChild() as any)?.getFirstChild()?.__src));
+  ok(src === "https://example.com/old.png", `a legacy image block renders as an image inside a paragraph (got ${src})`);
+
+  editor.update(() => ($getRoot().getFirstChild() as any).append($createTextNode(" caption")), { discrete: true });
+  const stored = (lb.get("blocks") as any).get("img-1");
+  ok(
+    stored.get("type") === "paragraph" && stored.get("runs")?.[0]?.image?.src === "https://example.com/old.png",
+    `the next local edit rewrites it in the inline shape (got ${JSON.stringify(stored.toJSON())})`
+  );
+  binding.destroy();
 }
 
 // --- Undo/redo go through Loro's UndoManager ---------------------------
