@@ -19,6 +19,7 @@ import {
   isSuggestionInsertMarkId,
   suggestionDeleteMarkId,
   suggestionInsertMarkId,
+  newMarkId,
 } from "./ids";
 
 export interface SuggestingActive {
@@ -34,7 +35,7 @@ export interface SuggestionController {
 }
 
 function newSuggestionId(): string {
-  return `sg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return newMarkId();
 }
 
 function walkNode(node: LexicalNode, visit: (node: LexicalNode) => void) {

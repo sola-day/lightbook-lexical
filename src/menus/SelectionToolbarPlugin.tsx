@@ -13,6 +13,7 @@ import { $createHeadingNode, $createQuoteNode, type HeadingTagType } from "@lexi
 import { INSERT_CHECK_LIST_COMMAND, INSERT_ORDERED_LIST_COMMAND, INSERT_UNORDERED_LIST_COMMAND } from "@lexical/list";
 import { TOGGLE_LINK_COMMAND } from "@lexical/link";
 import { addComment } from "../comments/plugin";
+import { newMarkId } from "../comments/ids";
 
 export interface SelectionToolbarPluginProps {
   /** Called after a comment thread is created via the toolbar's comment button. */
@@ -110,7 +111,7 @@ export function SelectionToolbarPlugin({ onComment }: SelectionToolbarPluginProp
       if ($isRangeSelection(selection)) previewText = selection.getTextContent();
     });
     if (!previewText) return;
-    const threadId = `thread-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const threadId = newMarkId();
     if (addComment(editor, { threadId })) onComment?.(threadId, previewText);
   };
 

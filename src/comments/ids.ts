@@ -46,3 +46,12 @@ export function suggestionIdFromMarkId(id: string): string | null {
   if (isSuggestionDeleteMarkId(id)) return id.slice(SUGGESTION_DELETE_PREFIX.length);
   return null;
 }
+
+/**
+ * New comment-thread / suggestion id. A UUID because the same id is also the
+ * server-side primary key (Lightbook's `comment_threads`/`suggestions` rows),
+ * so an anchor created offline needs no id mapping once it syncs.
+ */
+export function newMarkId(): string {
+  return crypto.randomUUID();
+}

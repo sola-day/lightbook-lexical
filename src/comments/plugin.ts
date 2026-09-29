@@ -1,7 +1,13 @@
 import type { LexicalEditor, LexicalNode } from "lexical";
 import { $getRoot, $getSelection, $isRangeSelection } from "lexical";
 import { $wrapSelectionInMarkNode, $unwrapMarkNode, $isMarkNode, MarkNode } from "@lexical/mark";
-import { commentMarkId, isCommentMarkId, threadIdFromMarkId } from "./ids";
+import {
+  commentMarkId,
+  isCommentMarkId,
+  isSuggestionInsertMarkId,
+  suggestionIdFromMarkId,
+  threadIdFromMarkId,
+} from "./ids";
 
 export interface AddCommentOptions {
   threadId: string;
@@ -98,4 +104,31 @@ export function setActiveThread(editor: LexicalEditor, threadId: string | null):
       el.classList.toggle("lb-comment-range--active", active);
     });
   });
+}
+
+export interface SuggestionRange {
+  suggestionId: string;
+  /** Text proposed for insertion (empty for a pure deletion). */
+  inserted: string;
+  /** Text proposed for deletion (empty for a pure insertion). */
+  deleted: string;
+}
+
+/** Lists every pending suggestion in the document, in document order. */
+export function listSuggestions(editor: LexicalEditor): Map<string, SuggestionRange> {
+  const suggestions = new Map<string, SuggestionRange>();
+  editor.getEditorState().read(() => {
+    walk($getRoot(), (node) => {
+      if (!$isMarkNode(node)) return;
+      for (const id of node.getIDs()) {
+        const suggestionId = suggestionIdFromMarkId(id);
+        if (!suggestionId) continue;
+        const entry = suggestions.get(suggestionId) ?? { suggestionId, inserted: "", deleted: "" };
+        if (isSuggestionInsertMarkId(id)) entry.inserted += node.getTextContent();
+        else entry.deleted += node.getTextContent();
+        suggestions.set(suggestionId, entry);
+      }
+    });
+  });
+  return suggestions;
 }

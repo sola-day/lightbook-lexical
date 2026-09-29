@@ -11,7 +11,7 @@ import {
 import { $isMarkNode } from "@lexical/mark";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { markdownToNodes, nodesToMarkdown } from "../src/markdown";
-import { addComment, listThreads, removeComment } from "../src/comments/plugin";
+import { addComment, listSuggestions, listThreads, removeComment } from "../src/comments/plugin";
 import { HISTORIC_TAG } from "lexical";
 import { createSuggestionController } from "../src/comments/suggestion";
 import { isSuggestionInsertMarkId, isSuggestionDeleteMarkId } from "../src/comments/ids";
@@ -233,6 +233,12 @@ function markIdsOf(editor: ReturnType<typeof newEditor>) {
     !idsAfterDelete.some((ids) => ids.some(isSuggestionInsertMarkId) && ids.some(isSuggestionDeleteMarkId)),
     "no MarkNode is tagged both suggestion_insert and suggestion_delete"
   );
+
+  const pending = [...listSuggestions(editor).values()];
+  ok(pending.some((p) => p.inserted === "XY"), `listSuggestions reports the pending insertion (got ${JSON.stringify(pending)})`);
+  ok(pending.some((p) => p.deleted === "de"), "listSuggestions reports the pending deletion");
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+  ok(pending.every((p) => uuid.test(p.suggestionId)), "suggestion ids are UUIDs (they double as server primary keys)");
 }
 
 // Backspacing your own still-pending suggestion_insert should really delete it, not double-tag it.
