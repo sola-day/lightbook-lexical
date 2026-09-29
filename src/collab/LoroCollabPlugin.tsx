@@ -75,29 +75,18 @@ export function LoroCollabPlugin({ doc, presence }: LoroCollabPluginProps) {
 
       for (const remote of remotes) {
         seen.add(remote.peerId);
-        const el = editor.getElementByKey(remote.nodeKey);
-        if (!el) continue;
-
-        // Walk the block element's rendered text nodes to find the DOM
-        // point for `offset` characters in (same flattening blockSpec.ts
-        // uses for sync — see presence.ts's docstring).
-        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-        let remaining = remote.offset;
+        // Lexical resolved the cursor to a text node (see presence.ts), so
+        // only that node's DOM text needs indexing; a block without text
+        // gets the caret at its start.
+        const textEl = remote.textNodeKey ? editor.getElementByKey(remote.textNodeKey) : null;
+        const blockEl = editor.getElementByKey(remote.nodeKey);
         let point: { node: Node; offset: number } | null = null;
-        let current = walker.nextNode();
-        let last: Text | null = null;
-        while (current) {
-          const text = current as Text;
-          last = text;
-          const len = text.length;
-          if (remaining <= len) {
-            point = { node: text, offset: remaining };
-            break;
-          }
-          remaining -= len;
-          current = walker.nextNode();
+        const textNode = textEl ? document.createTreeWalker(textEl, NodeFilter.SHOW_TEXT).nextNode() : null;
+        if (textNode) {
+          point = { node: textNode, offset: Math.min(remote.textOffset ?? 0, (textNode as Text).length) };
+        } else if (blockEl) {
+          point = { node: blockEl, offset: 0 };
         }
-        if (!point && last) point = { node: last, offset: last.length };
         if (!point) continue;
 
         const range = document.createRange();

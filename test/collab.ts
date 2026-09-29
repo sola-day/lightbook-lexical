@@ -522,6 +522,60 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   bindingB.destroy();
 }
 
+// --- Presence offsets count through comment marks, links and inline images ---
+
+{
+  const editorA = newEditor();
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      const mark = $createMarkNode(["c:x"]);
+      mark.append($createTextNode("abc"));
+      const link = $createLinkNode("https://example.com");
+      link.append($createTextNode("lnk"));
+      p.append(mark, $createTextNode("def"), $createImageNode({ src: "https://example.com/i.png" }), link, $createTextNode("gh"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+  const offsets: Record<string, number | undefined> = {};
+  editorA.getEditorState().read(() => {
+    const p = $getRoot().getFirstChild() as any;
+    const [mark, def, , link, gh] = p.getChildren();
+    offsets.inMark = resolveLocalCursorPoint(bindingA, mark.getFirstChild(), 2)?.offset; // ab|c
+    offsets.afterMark = resolveLocalCursorPoint(bindingA, def, 2)?.offset; // abcde|f
+    offsets.inLinkAfterImage = resolveLocalCursorPoint(bindingA, link.getFirstChild(), 1)?.offset; // abcdef + image + l|nk
+    offsets.end = resolveLocalCursorPoint(bindingA, gh, 2)?.offset;
+  });
+  ok(offsets.inMark === 2, `a caret inside a comment mark flattens to its offset in the block (got ${offsets.inMark})`);
+  ok(offsets.afterMark === 5, `a caret after a comment mark counts the marked text (got ${offsets.afterMark})`);
+  ok(offsets.inLinkAfterImage === 8, `a caret inside a link after an image counts the image as one character (got ${offsets.inLinkAfterImage})`);
+  ok(offsets.end === 12, `the end of the block is its full length (got ${offsets.end})`);
+
+  const docB = new LoroDoc();
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  const store = createPresenceStore();
+  let blockId = "";
+  editorA.getEditorState().read(() => (blockId = bindingA.blockIdForNode($getRoot().getFirstChild()!)));
+  setPresence(store, "peer-a", { user: { name: "Alice", color: "#4285f4" }, blockId, offset: 8 });
+  const [remote] = resolveRemoteCursors(editorB, bindingB, store, "peer-b");
+  let landed = "";
+  editorB.getEditorState().read(() => {
+    const node = remote?.textNodeKey ? $getNodeByKey(remote.textNodeKey) : null;
+    landed = `${node?.getTextContent()}@${remote?.textOffset}`;
+  });
+  ok(landed === "lnk@1", `the remote cursor resolves to the same spot in the other editor (got ${landed})`);
+
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
 // --- A remote edit to one block must not rebuild unrelated blocks ---------
 // (readChildrenInto used to unconditionally clear()+rebuild EVERY
 // text-bearing block's children on every remote update, which would reset

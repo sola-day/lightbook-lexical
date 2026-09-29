@@ -10,6 +10,8 @@ import {
   type LexicalNode,
 } from "lexical";
 import type { LoroBinding } from "./binding";
+import { inlineSize } from "./blockSpec";
+import { $flattenPoint, $inlineLeaves, $locateFlatOffset } from "./caret";
 
 export interface PresenceUser {
   name: string;
@@ -75,35 +77,19 @@ export function bridgePresenceStores(a: EphemeralStore<PresenceState>, b: Epheme
   };
 }
 
-const TEXT_BEARING_TYPES = new Set(["paragraph", "heading", "quote", "code", "listitem"]);
-
-/** True for the Lexical node types `blockSpec.ts` gives a flattened `text` string to (see its `lexicalNodeToBlockSpec`). */
-function isTextBearingBlock(node: LexicalNode): node is ElementNode {
-  return $isElementNode(node) && TEXT_BEARING_TYPES.has(node.getType());
-}
-
 /**
- * Walks up from a text-selection point to its nearest text-bearing block
- * ancestor, and flattens the position to a single character offset within
- * that block — the same flattening `blockSpec.ts`'s `textRunsOf` does for
- * sync, so a broadcast `{blockId, offset}` addresses the same position a
- * remote peer's synced text will actually have.
+ * Flattens a selection point to `{blockId, offset}` in the units of the
+ * block's synced text (see `caret.ts`), so a broadcast position addresses
+ * the same character a remote peer's copy of the block has, whatever marks,
+ * links or images sit before it.
  */
 export function resolveLocalCursorPoint(
   binding: LoroBinding,
   anchorNode: LexicalNode,
   anchorOffset: number
 ): { blockId: string; offset: number } | null {
-  let block: LexicalNode | null = anchorNode;
-  while (block && !isTextBearingBlock(block)) block = block.getParent();
-  if (!block) return null;
-
-  let offset = anchorOffset;
-  for (const child of (block as ElementNode).getChildren()) {
-    if (child.getKey() === anchorNode.getKey()) break;
-    if ($isTextNode(child)) offset += child.getTextContentSize();
-  }
-  return { blockId: binding.blockIdForNode(block), offset };
+  const flat = $flattenPoint(anchorNode, anchorOffset);
+  return flat ? { blockId: binding.blockIdForNode(flat.block), offset: flat.offset } : null;
 }
 
 /** Reads the current selection's focus point (for the local peer's own broadcast) inside an `editor.getEditorState().read()`/`editor.update()` callback. */
@@ -120,9 +106,13 @@ export function readLocalCursorPayload(binding: LoroBinding, user: PresenceUser)
 export interface ResolvedRemoteCursor {
   peerId: string;
   user: PresenceUser;
+  /** The block the cursor is in. */
   nodeKey: string;
   /** Offset within the block, clamped to its current text length (the block may have shrunk since this was broadcast). */
   offset: number;
+  /** The text node the cursor falls in and the offset inside it, when the block has text (for drawing it). */
+  textNodeKey?: string;
+  textOffset?: number;
 }
 
 /**
@@ -147,8 +137,10 @@ export function resolveRemoteCursors(
       if (!nodeKey) continue;
       const node = $getNodeByKey(nodeKey);
       if (!$isElementNode(node)) continue;
-      const offset = Math.max(0, Math.min(payload.offset, node.getTextContentSize()));
-      out.push({ peerId, user: payload.user, nodeKey, offset });
+      const size = $inlineLeaves(node).reduce((sum, leaf) => sum + inlineSize(leaf), 0);
+      const offset = Math.max(0, Math.min(payload.offset, size));
+      const at = $locateFlatOffset(node, offset);
+      out.push({ peerId, user: payload.user, nodeKey, offset, textNodeKey: at?.node.getKey(), textOffset: at?.offset });
     }
   });
   return out;

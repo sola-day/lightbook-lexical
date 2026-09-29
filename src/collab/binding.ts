@@ -28,7 +28,8 @@ import {
   type PointType,
 } from "lexical";
 import { $isListItemNode, $isListNode } from "@lexical/list";
-import { inlineSize, lexicalNodeToBlockSpec, type BlockSpec, type TextRun } from "./blockSpec";
+import { lexicalNodeToBlockSpec, type BlockSpec, type TextRun } from "./blockSpec";
+import { $flattenPoint, $locateFlatOffset } from "./caret";
 import { canonicalRuns, configureTextStyles, hasMarks, readRunMarks, writeRunMarks } from "./richText";
 import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
 import { BlockIdRegistry } from "./blockIdRegistry";
@@ -389,30 +390,6 @@ function readLoroToLexical(
 
 // --- Caret <-> {blockId, offset} (for undo/redo) -------------------------
 
-const TEXT_BEARING_TYPES = new Set(["paragraph", "heading", "quote", "code", "listitem"]);
-
-function $textBlockOf(node: LexicalNode): ElementNode | null {
-  let current: LexicalNode | null = node;
-  while (current && !($isElementNode(current) && TEXT_BEARING_TYPES.has(current.getType()))) current = current.getParent();
-  return current as ElementNode | null;
-}
-
-/** The block's inline leaves (text, line breaks, ...) in order, looking through marks and links but not nested blocks. */
-function $inlineLeaves(block: ElementNode): LexicalNode[] {
-  const out: LexicalNode[] = [];
-  const walk = (parent: ElementNode) => {
-    for (const child of parent.getChildren()) {
-      if ($isElementNode(child)) {
-        if (child.isInline()) walk(child);
-      } else {
-        out.push(child);
-      }
-    }
-  };
-  walk(block);
-  return out;
-}
-
 interface BlockCaret {
   blockId: string;
   /** Flattened character offset within the block's text (same units as `blockSpec.ts`'s `text`). */
@@ -420,28 +397,8 @@ interface BlockCaret {
 }
 
 function $caretOfPoint(point: PointType, ids: BlockIdRegistry): BlockCaret | null {
-  let node: LexicalNode = point.getNode();
-  let leafOffset = point.offset;
-  if ($isElementNode(node)) {
-    const child = node.getChildAtIndex(point.offset) ?? node.getLastChild();
-    const atEnd = point.offset >= node.getChildrenSize();
-    if (!child) {
-      const block = $textBlockOf(node);
-      return block ? { blockId: ids.idFor(block), offset: 0 } : null;
-    }
-    const leaf: LexicalNode | null = $isElementNode(child) ? (atEnd ? child.getLastDescendant() : child.getFirstDescendant()) : child;
-    if (!leaf) return null;
-    node = leaf;
-    leafOffset = atEnd ? inlineSize(leaf) : 0;
-  }
-  const block = $textBlockOf(node);
-  if (!block) return null;
-  let offset = 0;
-  for (const leaf of $inlineLeaves(block)) {
-    if (leaf.is(node)) return { blockId: ids.idFor(block), offset: offset + leafOffset };
-    offset += inlineSize(leaf);
-  }
-  return { blockId: ids.idFor(block), offset };
+  const flat = $flattenPoint(point.getNode(), point.offset);
+  return flat ? { blockId: ids.idFor(flat.block), offset: flat.offset } : null;
 }
 
 function $readCaret(ids: BlockIdRegistry): BlockCaret | null {
@@ -453,16 +410,9 @@ function $restoreCaret(caret: BlockCaret, ids: BlockIdRegistry) {
   const key = ids.keyForId(caret.blockId);
   const block = key ? $getNodeByKey(key) : null;
   if (!$isElementNode(block)) return;
-  let remaining = caret.offset;
-  for (const leaf of $inlineLeaves(block)) {
-    const size = inlineSize(leaf);
-    if ($isTextNode(leaf) && remaining <= size) {
-      leaf.select(remaining, remaining);
-      return;
-    }
-    remaining -= size;
-  }
-  block.selectEnd();
+  const at = $locateFlatOffset(block, caret.offset);
+  if (at) at.node.select(at.offset, at.offset);
+  else block.selectEnd();
 }
 
 function readCaretIn(state: EditorState, ids: BlockIdRegistry): BlockCaret | null {
