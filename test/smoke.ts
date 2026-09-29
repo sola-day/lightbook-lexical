@@ -12,7 +12,7 @@ import { $isMarkNode } from "@lexical/mark";
 import { LIGHTBOOK_NODES } from "../src/nodes";
 import { markdownToNodes, nodesToMarkdown } from "../src/markdown";
 import { addComment, listSuggestions, listThreads, removeComment } from "../src/comments/plugin";
-import { HISTORIC_TAG } from "lexical";
+import { HISTORIC_TAG, DELETE_CHARACTER_COMMAND } from "lexical";
 import { createSuggestionController } from "../src/comments/suggestion";
 import { isSuggestionInsertMarkId, isSuggestionDeleteMarkId } from "../src/comments/ids";
 
@@ -641,6 +641,79 @@ function markIdsOf(editor: ReturnType<typeof newEditor>) {
   }
   const deleted = [...listSuggestions(editor).values()];
   ok(deleted.length === 1 && deleted[0].deleted === "ain", `repeated backspace extends one deletion suggestion (got ${JSON.stringify(deleted)})`);
+}
+
+// Backspace/Delete in suggesting mode go through DELETE_CHARACTER_COMMAND.
+// Deleting the last remaining character of a text node used to lose it for
+// real (Lexical removes the emptied node before any transform sees it) and
+// leave the caret inside the struck-through span.
+function pressDelete(editor: ReturnType<typeof newEditor>, isBackward: boolean, times: number) {
+  for (let i = 0; i < times; i++) {
+    editor.update(() => void editor.dispatchCommand(DELETE_CHARACTER_COMMAND, isBackward), { discrete: true });
+  }
+}
+
+function deletedSuggestionTexts(editor: ReturnType<typeof newEditor>) {
+  return [...listSuggestions(editor).values()].map((s) => s.deleted).filter(Boolean);
+}
+
+function typeAtCaret(editor: ReturnType<typeof newEditor>, text: string) {
+  editor.update(() => {
+    const selection = $getSelection();
+    if ($isRangeSelection(selection)) selection.insertText(text);
+  }, { discrete: true });
+}
+
+for (const [initial, isBackward, caret, presses, expectDeleted] of [
+  ["jiang", true, 5, 5, "jiang"],
+  ["hi jiang", true, 8, 5, "jiang"],
+  ["jiang", false, 0, 5, "jiang"],
+  ["jiang yo", false, 0, 6, "jiang "],
+] as const) {
+  const label = `${isBackward ? "Backspace" : "Delete"} x${presses} on ${JSON.stringify(initial)}`;
+  const editor = newEditor();
+  editor.update(() => {
+    const p = $createParagraphNode();
+    const t = $createTextNode(initial);
+    p.append(t);
+    $getRoot().clear().append(p);
+    t.select(caret, caret);
+  }, { discrete: true });
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+  pressDelete(editor, isBackward, presses);
+
+  ok(textOf(editor) === initial, `${label}: no character is really removed (got ${JSON.stringify(textOf(editor))})`);
+  const deleted = deletedSuggestionTexts(editor);
+  ok(deleted.length === 1 && deleted[0] === expectDeleted, `${label}: one deletion suggestion covering ${JSON.stringify(expectDeleted)} (got ${JSON.stringify(deleted)})`);
+
+  typeAtCaret(editor, "X");
+  const after = [...listSuggestions(editor).values()];
+  ok(
+    after.some((s) => s.inserted === "X") && after.some((s) => s.deleted === expectDeleted),
+    `${label}: typing afterwards lands outside the struck span as its own insertion (got ${JSON.stringify(after)})`
+  );
+
+  const deletionId = after.find((s) => s.deleted)!.suggestionId;
+  suggestion.rejectSuggestion(deletionId);
+  ok(textOf(editor).replace("X", "") === initial, `${label}: rejecting restores the full text (got ${JSON.stringify(textOf(editor))})`);
+}
+
+// A non-collapsed selection is struck through as one suggestion, not removed.
+{
+  const editor = newEditor();
+  editor.update(() => {
+    const p = $createParagraphNode();
+    const t = $createTextNode("hello world");
+    p.append(t);
+    $getRoot().clear().append(p);
+    t.select(0, 5);
+  }, { discrete: true });
+  const suggestion = createSuggestionController(editor);
+  suggestion.setSuggesting("alice");
+  pressDelete(editor, true, 1);
+  ok(textOf(editor) === "hello world", `deleting a selection keeps the text (got ${JSON.stringify(textOf(editor))})`);
+  ok(JSON.stringify(deletedSuggestionTexts(editor)) === '["hello"]', `the selection becomes one deletion suggestion (got ${JSON.stringify(deletedSuggestionTexts(editor))})`);
 }
 
 console.log(`\n${passed} passed, ${failed} failed.`);

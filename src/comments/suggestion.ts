@@ -3,11 +3,19 @@ import {
   $createTextNode,
   $getNodeByKey,
   $getRoot,
+  $getSelection,
   $hasUpdateTag,
+  $isElementNode,
+  $isRangeSelection,
   $isTextNode,
   $setSelection,
+  COMMAND_PRIORITY_HIGH,
+  DELETE_CHARACTER_COMMAND,
+  DELETE_LINE_COMMAND,
+  DELETE_WORD_COMMAND,
   HISTORIC_TAG,
   TextNode,
+  type RangeSelection,
   type ElementNode,
   type LexicalEditor,
   type LexicalNode,
@@ -120,6 +128,45 @@ function adjacentSuggestionMark(
   const after = node.getNextSibling();
   if (matches(after)) return { mark: after, side: "after" };
   return null;
+}
+
+/** Kind of the innermost pending suggestion mark around `node`, if any. */
+function $pendingSuggestionKind(node: LexicalNode): "insert" | "delete" | null {
+  let ancestor: LexicalNode | null = node.getParent();
+  while ($isMarkNode(ancestor)) {
+    for (const id of ancestor.getIDs()) {
+      if (isSuggestionInsertMarkId(id)) return "insert";
+      if (isSuggestionDeleteMarkId(id)) return "delete";
+    }
+    ancestor = ancestor.getParent();
+  }
+  return null;
+}
+
+/** Leaf (non-element) descendants of `element`, in document order. */
+function $leavesOf(element: ElementNode): LexicalNode[] {
+  const leaves: LexicalNode[] = [];
+  walkNode(element, (node) => {
+    if (!$isElementNode(node)) leaves.push(node);
+  });
+  return leaves;
+}
+
+/** Collapses the selection just outside `node` (before or after it). */
+function $placeCaretOutside(node: LexicalNode, side: "before" | "after") {
+  const sibling = side === "before" ? node.getPreviousSibling() : node.getNextSibling();
+  const selection = $createRangeSelection();
+  if ($isTextNode(sibling) && !$pendingSuggestionKind(sibling)) {
+    const offset = side === "before" ? sibling.getTextContentSize() : 0;
+    selection.anchor.set(sibling.getKey(), offset, "text");
+    selection.focus.set(sibling.getKey(), offset, "text");
+  } else {
+    const parent = node.getParentOrThrow();
+    const index = node.getIndexWithinParent() + (side === "after" ? 1 : 0);
+    selection.anchor.set(parent.getKey(), index, "element");
+    selection.focus.set(parent.getKey(), index, "element");
+  }
+  $setSelection(selection);
 }
 
 export function createSuggestionController(editor: LexicalEditor): SuggestionController {
@@ -333,6 +380,177 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     }
   });
 
+  // Deletion keys are handled *before* Lexical applies them rather than
+  // diffed afterwards by the transform above: when a deletion empties a
+  // TextNode (backspacing the last remaining character of a word that sits
+  // alone in its node, or next to a mark), Lexical removes that node in the
+  // same update, so no transform ever runs for it and the character is lost
+  // for real — and the caret lands inside the struck-through span. Marking
+  // the character as deleted up front sidesteps both.
+  function remember(node: TextNode) {
+    prevTextCache.set(node.getKey(), node.getTextContent());
+  }
+
+  /** Wraps `node` as deleted, joining an adjacent pending deletion when there is one. */
+  function $markDeleted(node: TextNode, isBackward: boolean, suggestionId: string): MarkNode {
+    const isDeleteMark = (n: LexicalNode | null): n is MarkNode =>
+      $isMarkNode(n) && n.getIDs().length === 1 && isSuggestionDeleteMarkId(n.getIDs()[0]);
+    const next = node.getNextSibling();
+    const prev = node.getPreviousSibling();
+    let mark: MarkNode;
+    if (isBackward && isDeleteMark(next)) {
+      mark = next;
+      mark.splice(0, 0, [node]);
+    } else if (!isBackward && isDeleteMark(prev)) {
+      mark = prev;
+      mark.append(node);
+    } else if (isDeleteMark(prev)) {
+      mark = prev;
+      mark.append(node);
+    } else if (isDeleteMark(next)) {
+      mark = next;
+      mark.splice(0, 0, [node]);
+    } else {
+      const deleteId = suggestionDeleteMarkId(suggestionId);
+      mark = $createMarkNode([deleteId]);
+      node.replace(mark);
+      mark.append(node);
+      indexAdd(deleteId, mark.getKey());
+    }
+    remember(node);
+    return mark;
+  }
+
+  /** Backspace/Delete of one character at a collapsed caret. */
+  function $suggestDeleteCharacter(selection: RangeSelection, isBackward: boolean): boolean {
+    const anchor = selection.anchor;
+    let leaf: LexicalNode | null;
+    let offset: number;
+    if (anchor.type === "text") {
+      leaf = anchor.getNode();
+      offset = anchor.offset;
+    } else {
+      const element = anchor.getNode();
+      if (!$isElementNode(element)) return false;
+      const after = element.getChildAtIndex(anchor.offset);
+      const before = anchor.offset > 0 ? element.getChildAtIndex(anchor.offset - 1) : null;
+      if (before) {
+        leaf = $isElementNode(before) ? before.getLastDescendant() : before;
+        offset = leaf ? leaf.getTextContentSize() : 0;
+      } else if (after) {
+        leaf = $isElementNode(after) ? after.getFirstDescendant() : after;
+        offset = 0;
+      } else {
+        return false;
+      }
+    }
+    if (!leaf) return false;
+    const block = leaf.getParents().find((n) => $isElementNode(n) && !n.isInline());
+    if (!block || !$isElementNode(block)) return false;
+    const leaves = $leavesOf(block);
+    let i = leaves.findIndex((n) => n.is(leaf));
+    if (i < 0) return false;
+
+    // Walk toward the character to delete, hopping over text that is already
+    // struck through; anything but plain text (line break, image, ...) or a
+    // block boundary falls back to Lexical's own behavior.
+    let o = offset;
+    let target: { node: TextNode; start: number; end: number } | null = null;
+    while (!target) {
+      const node = leaves[i];
+      if (!$isTextNode(node)) return false;
+      const size = node.getTextContentSize();
+      const struck = $pendingSuggestionKind(node) === "delete";
+      if (!struck && (isBackward ? o > 0 : o < size)) {
+        const text = node.getTextContent();
+        let start = isBackward ? o - 1 : o;
+        let end = start + 1;
+        if (isBackward && start > 0 && /[\uDC00-\uDFFF]/.test(text[start]) && /[\uD800-\uDBFF]/.test(text[start - 1])) start--;
+        if (!isBackward && end < size && /[\uD800-\uDBFF]/.test(text[start]) && /[\uDC00-\uDFFF]/.test(text[end])) end++;
+        target = { node, start, end };
+        break;
+      }
+      i += isBackward ? -1 : 1;
+      if (i < 0 || i >= leaves.length) return false;
+      o = isBackward ? leaves[i].getTextContentSize() : 0;
+    }
+
+    if ($pendingSuggestionKind(target.node) === "insert") {
+      // Deleting your own pending insertion removes it for real.
+      const range = $createRangeSelection();
+      range.anchor.set(target.node.getKey(), target.start, "text");
+      range.focus.set(target.node.getKey(), target.end, "text");
+      $setSelection(range);
+      range.removeText();
+      return true;
+    }
+
+    const { node, start, end } = target;
+    const offsets = [start, end].filter((x) => x > 0 && x < node.getTextContentSize());
+    const parts = offsets.length ? node.splitText(...offsets) : [node];
+    const deleted = parts[start > 0 ? 1 : 0];
+    for (const part of parts) remember(part);
+    const mark = $markDeleted(deleted, isBackward, newSuggestionId());
+    $placeCaretOutside(mark, isBackward ? "before" : "after");
+    return true;
+  }
+
+  /** Deletion of a non-collapsed selection: strike it through instead. */
+  function $suggestDeleteRange(selection: RangeSelection): boolean {
+    const texts = selection.extract().filter($isTextNode);
+    const plain = texts.filter((n) => !$pendingSuggestionKind(n));
+    const ownInserts = texts.filter((n) => $pendingSuggestionKind(n) === "insert");
+    if (plain.length === 0) {
+      if (ownInserts.length === 0) {
+        // Only already-struck text is selected: nothing to delete.
+        $placeCaretOutside(texts[0]?.getParent() ?? selection.anchor.getNode(), "before");
+        return true;
+      }
+      return false; // only your own pending insertions: delete them for real
+    }
+    const suggestionId = newSuggestionId();
+    let first: MarkNode | null = null;
+    for (const node of plain) {
+      const mark = $markDeleted(node, true, suggestionId);
+      first ??= mark;
+    }
+    for (const node of ownInserts) {
+      const parent = node.getParent();
+      node.remove();
+      if ($isMarkNode(parent) && parent.getChildrenSize() === 0) parent.remove();
+    }
+    $placeCaretOutside(first!, "before");
+    return true;
+  }
+
+  function registerDeletion(command: typeof DELETE_CHARACTER_COMMAND, granularity: "character" | "word" | "lineboundary") {
+    return editor.registerCommand(
+      command,
+      (isBackward) => {
+        if (!active || isResolving || editor.isComposing()) return false;
+        const selection = $getSelection();
+        if (!$isRangeSelection(selection)) return false;
+        if (selection.isCollapsed()) {
+          if (granularity === "character") return $suggestDeleteCharacter(selection, isBackward);
+          try {
+            // Needs the DOM selection; unavailable headless.
+            selection.modify("extend", isBackward, granularity);
+          } catch {
+            return false;
+          }
+          if (selection.isCollapsed()) return false;
+        }
+        return $suggestDeleteRange(selection);
+      },
+      COMMAND_PRIORITY_HIGH,
+    );
+  }
+  const unregisterCommands = [
+    registerDeletion(DELETE_CHARACTER_COMMAND, "character"),
+    registerDeletion(DELETE_WORD_COMMAND, "word"),
+    registerDeletion(DELETE_LINE_COMMAND, "lineboundary"),
+  ];
+
   function resolve(suggestionId: string, action: "accept" | "reject") {
     const insertId = suggestionInsertMarkId(suggestionId);
     const deleteId = suggestionDeleteMarkId(suggestionId);
@@ -411,6 +629,7 @@ export function createSuggestionController(editor: LexicalEditor): SuggestionCon
     },
     destroy() {
       unregisterTransform();
+      for (const unregister of unregisterCommands) unregister();
     },
   };
 }
