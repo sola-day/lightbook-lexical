@@ -1,10 +1,19 @@
-import { UndoManager, type Cursor, type LoroDoc, type LoroEventBatch, type LoroMovableList, type LoroMap, type LoroText } from "loro-crdt";
+import {
+  LoroMap,
+  LoroMovableList,
+  LoroText,
+  UndoManager,
+  type Cursor,
+  type LoroDoc,
+  type LoroEventBatch,
+} from "loro-crdt";
 import {
   $addUpdateTag,
   $getNodeByKey,
   $getRoot,
   $getSelection,
   $isElementNode,
+  $isParagraphNode,
   $isRangeSelection,
   $isTextNode,
   COLLABORATION_TAG,
@@ -19,7 +28,8 @@ import {
   type PointType,
 } from "lexical";
 import { $isListItemNode, $isListNode } from "@lexical/list";
-import { inlineSize, lexicalNodeToBlockSpec, type BlockSpec } from "./blockSpec";
+import { inlineSize, lexicalNodeToBlockSpec, type BlockSpec, type TextRun } from "./blockSpec";
+import { canonicalRuns, configureTextStyles, hasMarks, readRunMarks, writeRunMarks } from "./richText";
 import { applyTextRuns, createLexicalNodeForType } from "./buildLexicalNode";
 import { BlockIdRegistry } from "./blockIdRegistry";
 
@@ -65,27 +75,25 @@ function stableStringify(value: unknown): string {
  *     that block's own container map, with:
  *       - `type` / `attrs`: plain (non-CRDT) values, overwritten wholesale
  *         on every change that touches them.
- *       - `text` (text-bearing types only): a mergeable `LoroText` — this
- *         is the ONLY thing that gets real character-level CRDT merging.
- *         Two peers typing concurrently in the same paragraph converge
- *         losslessly via Loro's Fugue algorithm, same as Yjs/ProseMirror
- *         collab. This is deliberately the one place real merge effort
- *         goes, because it's the scenario "feels like Google Docs" is
- *         actually judged on.
- *       - `runs` (text-bearing types only): a plain JSON formatting
- *         snapshot (see `blockSpec.ts`) — NOT merged; two peers changing
- *         formatting on the same block concurrently can overwrite each
- *         other. Accepted trade for this tier.
+ *       - `text` (text-bearing types only): a mergeable `LoroText` whose
+ *         characters merge via Loro's Fugue algorithm, and whose marks
+ *         carry the block's inline structure (formatting, links,
+ *         comment/suggestion marks, inline images; see `richText.ts`), so
+ *         two peers typing concurrently in the same formatted, commented
+ *         paragraph converge without losing either.
+ *       - `runs` (legacy, read only): the whole-block formatting value
+ *         older documents used; dropped on the block's next local edit.
  *       - `childOrder` (container types only): a mergeable
  *         `LoroMovableList<string>` of this block's own children's ids, same
  *         shape as `rootOrder` one level down — recursion, not a flat
  *         per-type table.
  *
- *   `ensureMergeable*` (not `setContainer`) is used throughout so two
- *   peers independently creating "the same" block under the same parent
- *   key at the same moment deterministically converge on one container
- *   instead of forking into two hidden branches — see loro-crdt's own
- *   docs on `LoroMap.ensureMergeable*`.
+ *   The two top-level containers are `ensureMergeable*` so every peer's
+ *   copy converges on one; they are created when a binding starts, outside
+ *   undo history. Per-block containers are plain `setContainer` children:
+ *   block ids are random per creator, so there is nothing to converge,
+ *   and Loro's redo of a mergeable container's creation duplicates its
+ *   contents (undo + redo of a new paragraph doubled its text).
  *
  * Known v1 scope cuts (all documented in the README too):
  *   - Blockquotes flatten to one text block (no nested multi-paragraph
@@ -121,18 +129,44 @@ function rootMap(doc: LoroDoc): LoroMap {
 
 // --- Lexical -> Loro ---------------------------------------------------
 
-function writeAttrsAndText(block: LoroMap, spec: BlockSpec) {
+function childMap(parent: LoroMap, key: string): LoroMap {
+  const existing = parent.get(key);
+  return existing instanceof LoroMap ? existing : parent.setContainer(key, new LoroMap());
+}
+
+function childText(parent: LoroMap, key: string): LoroText {
+  const existing = parent.get(key);
+  return existing instanceof LoroText ? existing : parent.setContainer(key, new LoroText());
+}
+
+function childList(parent: LoroMap, key: string): LoroMovableList {
+  const existing = parent.get(key);
+  return existing instanceof LoroMovableList ? existing : parent.setContainer(key, new LoroMovableList());
+}
+
+/**
+ * What each block's text and marks were last written as, so a keystroke in
+ * one block doesn't re-read every other block's marks. Only a shortcut: a
+ * miss just reconciles against the doc.
+ */
+type WrittenCache = Map<string, string>;
+
+function writeAttrsAndText(id: string, block: LoroMap, spec: BlockSpec, written: WrittenCache) {
   if (block.get("type") !== spec.type) block.set("type", spec.type);
   const prevAttrsJSON = stableStringify(block.get("attrs") ?? null);
   const nextAttrsJSON = stableStringify(spec.attrs ?? null);
   if (prevAttrsJSON !== nextAttrsJSON) block.set("attrs", spec.attrs as never);
 
   if (spec.text !== undefined) {
-    const textContainer = block.ensureMergeableText("text");
+    const textContainer = childText(block, "text");
+    const runs = spec.runs ? canonicalRuns(spec.runs) : undefined;
+    const key = stableStringify([spec.text, runs ?? null]);
+    if (written.get(id) === key && block.get("runs") === undefined) return;
     if (textContainer.toString() !== spec.text) textContainer.update(spec.text);
-    const prevRunsJSON = stableStringify(block.get("runs") ?? []);
-    const nextRunsJSON = stableStringify(spec.runs ?? []);
-    if (prevRunsJSON !== nextRunsJSON) block.set("runs", (spec.runs ?? []) as never);
+    if (runs) writeRunMarks(textContainer, runs);
+    // Legacy: formatting used to be a whole-block `runs` value.
+    if (block.get("runs") !== undefined) block.delete("runs");
+    written.set(id, key);
   }
 }
 
@@ -175,28 +209,34 @@ function reconcileOrder(list: LoroMovableList, targetIds: string[]) {
   }
 }
 
-function writeChildren(blocksMap: LoroMap, orderList: LoroMovableList, nodes: LexicalNode[], ids: BlockIdRegistry) {
+function writeChildren(
+  blocksMap: LoroMap,
+  orderList: LoroMovableList,
+  nodes: LexicalNode[],
+  ids: BlockIdRegistry,
+  written: WrittenCache
+) {
   const currentIds: string[] = [];
   for (const node of nodes) {
     const spec = lexicalNodeToBlockSpec(node);
     if (!spec) continue;
     const id = ids.idFor(node);
     currentIds.push(id);
-    const block = blocksMap.ensureMergeableMap(id);
-    writeAttrsAndText(block, spec);
+    const block = childMap(blocksMap, id);
+    writeAttrsAndText(id, block, spec, written);
     if (spec.children !== undefined) {
-      const childOrder = block.ensureMergeableMovableList("childOrder");
-      writeChildren(blocksMap, childOrder, spec.children, ids);
+      const childOrder = childList(block, "childOrder");
+      writeChildren(blocksMap, childOrder, spec.children, ids, written);
     }
   }
   reconcileOrder(orderList, currentIds);
 }
 
-function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry) {
+function writeLexicalToLoro(doc: LoroDoc, root: ElementNode, ids: BlockIdRegistry, written: WrittenCache) {
   const lb = rootMap(doc);
   const orderList = lb.ensureMergeableMovableList(ROOT_ORDER_KEY);
   const blocksMap = lb.ensureMergeableMap(BLOCKS_KEY);
-  writeChildren(blocksMap, orderList, root.getChildren(), ids);
+  writeChildren(blocksMap, orderList, root.getChildren(), ids, written);
   doc.commit({ origin: "lb-local-edit" });
 }
 
@@ -230,6 +270,13 @@ function $updateAttrsInPlace(node: LexicalNode, type: string, attrs: Record<stri
     return $matchesBlock(node, type, attrs, built);
   }
   return false;
+}
+
+/** The editor holds nothing but one empty paragraph. */
+function $isPlaceholderOnly(): boolean {
+  const root = $getRoot();
+  const only = root.getFirstChild();
+  return root.getChildrenSize() === 1 && $isParagraphNode(only) && only.getChildrenSize() === 0;
 }
 
 /** True when every `blocksMap`/`orderList` entry referenced actually resolves — used to detect "empty doc". */
@@ -268,10 +315,13 @@ function readChildrenInto(
     }
     nextChildren.push(node);
 
-    const textContainer = block.get("text") as { toString(): string } | undefined;
+    const textContainer = block.get("text") as LoroText | undefined;
     if (textContainer != null && $isElementNode(node)) {
       const text = textContainer.toString();
-      const runs = block.get("runs") as { text: string; formats: string[] }[] | undefined;
+      // Code blocks are plain text; everything else carries its inline
+      // structure as marks (or, written before that, a legacy `runs` value).
+      const legacyRuns = block.get("runs") as TextRun[] | undefined;
+      const runs = type === "code" ? undefined : legacyRuns && !hasMarks(textContainer) ? legacyRuns : readRunMarks(textContainer);
       // `applyTextRuns` destructively `clear()`s and rebuilds the block's
       // text children, which resets any local selection anchored inside
       // it. `readChildrenInto` walks and re-applies EVERY block on every
@@ -281,9 +331,10 @@ function readChildrenInto(
       // rebuild when this block's own current content already matches.
       const currentSpec = lexicalNodeToBlockSpec(node);
       const textChanged = currentSpec?.text !== text;
-      const runsChanged = stableStringify(currentSpec?.runs ?? []) !== stableStringify(runs ?? []);
+      const runsChanged =
+        stableStringify(canonicalRuns(currentSpec?.runs ?? [])) !== stableStringify(canonicalRuns(runs ?? []));
       if (textChanged || runsChanged) {
-        applyTextRuns(node, text, runs as never);
+        applyTextRuns(node, text, runs);
       }
     }
 
@@ -310,8 +361,13 @@ function $applyLoroToLexical(doc: LoroDoc, ids: BlockIdRegistry, reuse: Map<stri
   const orderList = lb.get(ROOT_ORDER_KEY) as LoroMovableList | undefined;
   const blocksMap = lb.get(BLOCKS_KEY) as LoroMap | undefined;
   const root = $getRoot();
-  if (!orderList || !blocksMap) return;
-  readChildrenInto(root, blocksMap, orderList, ids, reuse, built);
+  if (orderList && blocksMap) {
+    readChildrenInto(root, blocksMap, orderList, ids, reuse, built);
+  } else {
+    // No containers at all (e.g. undoing a page's very first edit removed
+    // them): an empty page.
+    root.clear();
+  }
   if (root.getChildrenSize() === 0) {
     root.append(createLexicalNodeForType("paragraph", {}));
   }
@@ -441,6 +497,19 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
   const ids = new BlockIdRegistry();
   let reuse = new Map<string, LexicalNode>();
   const built: BuiltFrom = new Map();
+  const written: WrittenCache = new Map();
+  configureTextStyles(doc);
+
+  // The top-level containers exist from the start, outside undo history:
+  // undoing a page's first edit must not delete them (Loro's redo of a
+  // mergeable container's creation duplicates its contents). Empty
+  // mergeable containers created by several peers converge, so this adds
+  // nothing visible to anyone.
+  if (!rootMap(doc).get(ROOT_ORDER_KEY) || !rootMap(doc).get(BLOCKS_KEY)) {
+    rootMap(doc).ensureMergeableMovableList(ROOT_ORDER_KEY);
+    rootMap(doc).ensureMergeableMap(BLOCKS_KEY);
+    doc.commit({ origin: "lb-init" });
+  }
 
   if (isLoroDocEmpty(doc)) {
     editor.update(
@@ -448,12 +517,16 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
         const root = $getRoot();
         // `LightbookEditor` passes `editorState: null` when it's given a
         // `collabPlugins` slot (per Lexical's own convention for pairing
-        // with a collab binding), which leaves root with zero children —
-        // give it one so the doc this seeds isn't degenerately empty.
-        if (root.getChildrenSize() === 0) {
-          root.append(createLexicalNodeForType("paragraph", {}));
-        }
-        writeLexicalToLoro(doc, root, ids);
+        // with a collab binding), which leaves root with zero children.
+        // Show an empty paragraph, but keep it out of the doc: the doc is
+        // usually only empty because its real content hasn't arrived yet,
+        // and a written placeholder would merge in as an extra paragraph
+        // on every device that opens the page. It's written with the first
+        // real edit instead.
+        if (root.getChildrenSize() === 0) root.append(createLexicalNodeForType("paragraph", {}));
+        // (The browser editor usually has that empty paragraph already.)
+        if ($isPlaceholderOnly()) return;
+        writeLexicalToLoro(doc, root, ids, written);
       },
       { discrete: true }
     );
@@ -523,7 +596,10 @@ export function createLoroBinding(editor: LexicalEditor, options: LoroBindingOpt
     if (dirtyElements.size === 0 && dirtyLeaves.size === 0) return;
     caretBeforeEdit = readCaretIn(prevEditorState, ids);
     editor.getEditorState().read(() => {
-      writeLexicalToLoro(doc, $getRoot(), ids);
+      // Until the doc has content, the editor's lone empty paragraph is a
+      // placeholder (see the seeding above), whatever else touched it.
+      if (isLoroDocEmpty(doc) && $isPlaceholderOnly()) return;
+      writeLexicalToLoro(doc, $getRoot(), ids, written);
     });
     reuse = rebuildReuseMap(editor, ids);
   });

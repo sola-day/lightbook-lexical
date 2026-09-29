@@ -85,6 +85,69 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   bindingB.destroy();
 }
 
+// --- Opening a page before its content arrives adds nothing to the shared doc ---
+//
+// The web app binds the editor to a still-empty doc while the server's
+// copy is in flight. The placeholder paragraph the editor shows meanwhile
+// must stay local, or every device's first open adds an empty paragraph.
+
+{
+  const editorA = newEditor();
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      p.append($createTextNode("server content"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const docA = new LoroDoc();
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+
+  const editorB = newEditor();
+  const docB = new LoroDoc();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+  ok(textOf(editorB) === "", "a late peer shows an empty placeholder while its doc is still empty");
+  ok(((docB.getMap("lb").get("rootOrder") as any)?.length ?? 0) === 0, "the placeholder is not written into the doc");
+
+  docB.import(docA.export({ mode: "snapshot" }));
+  let blocks = 0;
+  editorB.getEditorState().read(() => (blocks = $getRoot().getChildrenSize()));
+  ok(textOf(editorB) === "server content" && blocks === 1, `the arriving content replaces the placeholder (got ${JSON.stringify(textOf(editorB))}, ${blocks} blocks)`);
+  ok(docB.export({ mode: "update", from: docA.oplogVersion() }).length === 0 || (() => {
+    const probe = new LoroDoc();
+    probe.import(docA.export({ mode: "snapshot" }));
+    probe.import(docB.export({ mode: "update", from: docA.oplogVersion() }));
+    return JSON.stringify(probe.toJSON()) === JSON.stringify(docA.toJSON());
+  })(), "the late peer has nothing of its own to send back");
+
+  // Same when the editor already holds an empty paragraph (as a browser editor does).
+  const editorE = newEditor();
+  editorE.update(() => $getRoot().append($createParagraphNode()), { discrete: true });
+  const docE = new LoroDoc();
+  const bindingE = createLoroBinding(editorE, { doc: docE });
+  ok(((docE.getMap("lb").get("rootOrder") as any)?.length ?? 0) === 0, "an editor's own empty paragraph isn't written into an empty doc either");
+  bindingE.destroy();
+
+  // Typing into an empty page does reach the doc.
+  const editorC = newEditor();
+  const docC = new LoroDoc();
+  const bindingC = createLoroBinding(editorC, { doc: docC });
+  editorC.update(() => ($getRoot().getFirstChild() as any).append($createTextNode("first words")), { discrete: true });
+  const docD = new LoroDoc();
+  docD.import(docC.export({ mode: "snapshot" }));
+  const editorD = newEditor();
+  const bindingD = createLoroBinding(editorD, { doc: docD });
+  ok(textOf(editorD) === "first words", `the first edit on an empty page is written (got ${JSON.stringify(textOf(editorD))})`);
+
+  bindingA.destroy();
+  bindingB.destroy();
+  bindingC.destroy();
+  bindingD.destroy();
+}
+
 // --- Two bridged peers converge on structural edits -----------------------
 //
 // Bootstrap order matters here: two peers that each independently seed
@@ -600,6 +663,114 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   bindingB.destroy();
 }
 
+// --- Concurrent typing in one block keeps its formatting, links and comment/suggestion marks ---
+//
+// Inline structure is stored as marks on the block's LoroText, so it merges
+// character by character along with the text (a whole-block formatting
+// value would be last-writer-wins, and a length mismatch used to strip it).
+
+{
+  const editorA = newEditor();
+  editorA.update(
+    () => {
+      const root = $getRoot();
+      root.clear();
+      const p = $createParagraphNode();
+      const comment = $createMarkNode(["c:t1"]);
+      comment.append($createTextNode("hello"));
+      const bold = $createTextNode(" bold");
+      bold.toggleFormat("bold");
+      const link = $createLinkNode("https://example.com");
+      link.append($createTextNode(" link"));
+      const suggestion = $createMarkNode(["si:s1"]);
+      suggestion.append($createTextNode(" new"));
+      p.append(comment, bold, link, suggestion, $createTextNode(" end"));
+      root.append(p);
+    },
+    { discrete: true }
+  );
+  const docA = new LoroDoc();
+  docA.setPeerId(1n);
+  const bindingA = createLoroBinding(editorA, { doc: docA });
+  const docB = new LoroDoc();
+  docB.setPeerId(2n);
+  docB.import(docA.export({ mode: "snapshot" }));
+  const editorB = newEditor();
+  const bindingB = createLoroBinding(editorB, { doc: docB });
+
+  // Both type at the same time, not yet connected: A inside the bold word, B at the end.
+  editorA.update(
+    () => {
+      const bold = ($getRoot().getFirstChild() as any).getChildAtIndex(1);
+      bold.setTextContent(" bo!ld");
+    },
+    { discrete: true }
+  );
+  editorB.update(
+    () => {
+      const last = ($getRoot().getFirstChild() as any).getLastChild();
+      last.setTextContent(" end?");
+    },
+    { discrete: true }
+  );
+  const fromA = docA.export({ mode: "update", from: docB.oplogVersion() });
+  const fromB = docB.export({ mode: "update", from: docA.oplogVersion() });
+  docB.import(fromA);
+  docA.import(fromB);
+
+  for (const [name, editor] of [["A", editorA], ["B", editorB]] as const) {
+    let summary: Record<string, unknown> = {};
+    editor.getEditorState().read(() => {
+      const p = $getRoot().getFirstChild() as any;
+      const bold = p.getAllTextNodes().find((t: any) => t.hasFormat("bold"));
+      const link = p.getChildren().find((c: any) => $isLinkNode(c));
+      const marks = p.getChildren().filter((c: any) => $isMarkNode(c)).map((m: any) => `${m.getIDs().join()}=${m.getTextContent()}`);
+      summary = { text: p.getTextContent(), bold: bold?.getTextContent(), link: link?.getTextContent(), marks };
+    });
+    ok(
+      summary.text === "hello bo!ld link new end?" &&
+        summary.bold === " bo!ld" &&
+        summary.link === " link" &&
+        JSON.stringify(summary.marks) === JSON.stringify(["c:t1=hello", "si:s1= new"]),
+      `peer ${name} keeps bold, link, comment and suggestion marks after concurrent typing (got ${JSON.stringify(summary)})`
+    );
+  }
+  let listed: string[] = [];
+  editorB.getEditorState().read(() => (listed = [...listSuggestions(editorB).values()].map((s) => s.inserted)));
+  ok(JSON.stringify(listed) === JSON.stringify([" new"]), `the suggestion is still pending on the other peer (got ${JSON.stringify(listed)})`);
+
+  bindingA.destroy();
+  bindingB.destroy();
+}
+
+// --- A block written in the legacy `runs` shape still renders its formatting, and is migrated on the next edit ---
+
+{
+  const doc = new LoroDoc();
+  const lb = doc.getMap("lb");
+  const block = lb.ensureMergeableMap("blocks").ensureMergeableMap("old-1");
+  block.set("type", "paragraph");
+  block.set("attrs", {} as never);
+  block.ensureMergeableText("text").update("plain bold");
+  block.set("runs", [{ text: "plain ", formats: [] }, { text: "bold", formats: ["bold"] }] as never);
+  lb.ensureMergeableMovableList("rootOrder").push("old-1");
+  doc.commit();
+
+  const editor = newEditor();
+  const binding = createLoroBinding(editor, { doc });
+  let bold: string | undefined;
+  editor.getEditorState().read(() => (bold = ($getRoot().getFirstChild() as any).getAllTextNodes().find((t: any) => t.hasFormat("bold"))?.getTextContent()));
+  ok(bold === "bold", `a legacy runs block renders its formatting (got ${bold})`);
+
+  editor.update(() => ($getRoot().getFirstChild() as any).append($createTextNode("!")), { discrete: true });
+  const text = block.get("text") as any;
+  ok(
+    block.get("runs") === undefined && JSON.stringify(text.toDelta()) === JSON.stringify([{ insert: "plain " }, { insert: "bold", attributes: { bold: true } }, { insert: "!" }]),
+    `the next local edit migrates it to marks (got runs=${JSON.stringify(block.get("runs"))}, delta=${JSON.stringify(text.toDelta())})`
+  );
+  binding.destroy();
+}
+
 // --- A legacy top-level "image" block (written before images were inline) still renders ---
 
 {
@@ -620,7 +791,7 @@ function textOf(editor: ReturnType<typeof newEditor>) {
   editor.update(() => ($getRoot().getFirstChild() as any).append($createTextNode(" caption")), { discrete: true });
   const stored = (lb.get("blocks") as any).get("img-1");
   ok(
-    stored.get("type") === "paragraph" && stored.get("runs")?.[0]?.image?.src === "https://example.com/old.png",
+    stored.get("type") === "paragraph" && stored.get("text").toDelta()[0]?.attributes?.image?.src === "https://example.com/old.png",
     `the next local edit rewrites it in the inline shape (got ${JSON.stringify(stored.toJSON())})`
   );
   binding.destroy();
@@ -686,6 +857,22 @@ function press(editor: ReturnType<typeof newEditor>, command: typeof UNDO_COMMAN
   typeAtEnd(editor, "!");
   press(editor, UNDO_COMMAND);
   ok(textOf(editor) === "hello world", `an edit after redo is its own undo step (got ${JSON.stringify(textOf(editor))})`);
+
+  // A whole new block, undone and redone twice, comes back exactly once.
+  await pause(600);
+  editor.update(
+    () => {
+      const p = $createParagraphNode();
+      p.append($createTextNode("second"));
+      $getRoot().append(p);
+    },
+    { discrete: true }
+  );
+  press(editor, UNDO_COMMAND);
+  press(editor, REDO_COMMAND);
+  press(editor, UNDO_COMMAND);
+  press(editor, REDO_COMMAND);
+  ok(textOf(editor) === "hello world\n\nsecond", `undo/redo of a new block doesn't duplicate its text (got ${JSON.stringify(textOf(editor))})`);
   binding.destroy();
 }
 

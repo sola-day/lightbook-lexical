@@ -61,10 +61,12 @@ algebra across all of them):
   Myers' algorithm). This is deliberate: two people typing concurrently in
   the same paragraph is the scenario "feels like Google Docs" is actually
   judged on, so that's where the real merge effort goes.
-- Inline **formatting** (bold/italic/etc, as a run-length snapshot) is
-  synced as a plain value, overwritten wholesale on change — not merged
-  character-by-character. Concurrent formatting edits to the same
-  paragraph can overwrite each other.
+- Inline **structure** — formatting, links, comment/suggestion marks and
+  inline images — is stored as character-level marks on the same
+  `LoroText` (see `src/collab/richText.ts`), so it merges along with the
+  text: two people typing into the same bold, commented sentence keep the
+  bold and the comment. (Older documents stored a whole-block `runs`
+  value; it is still read, and replaced by marks on the block's next edit.)
 - Block **order** is a mergeable `LoroMovableList` of block ids, one per
   nesting level (`rootOrder`, and each container block's own
   `childOrder`), reconciled with real `LoroMovableList.move()` ops for
